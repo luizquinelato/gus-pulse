@@ -1,0 +1,35 @@
+{
+  // Suppress CSS warnings for Tailwind directives
+  "css.lint.unknownAtRules": "ignore",
+  // TypeScript settings
+  "js/ts.tsdk.path": "node_modules/typescript/lib",
+  "js/ts.tsdk.promptToUseWorkspaceVersion": true,
+  // Editor settings
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+  // File associations
+  "files.associations": {
+    "*.css": "tailwindcss"
+  },
+  // Exclude from file watcher
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/node_modules/**": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/.venv/**": true,
+    "**/venv/**": true,
+    "**/__pycache__/**": true,
+    "**/.pytest_cache/**": true
+  },
+  // Python settings
+  // Type checking, diagnostics and extraPaths are controlled by pyrightconfig.json
+  "python.analysis.autoImportCompletions": true,
+  "python.autoComplete.extraPaths": [
+    "${workspaceFolder}/services/backend",
+    "${workspaceFolder}/services/auth"
+  ],
+}

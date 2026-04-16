@@ -1,0 +1,287 @@
+-- Fix missing primary keys and foreign keys in source database
+-- Based on migration 001_initial_schema.py and unified_models.py
+-- Run this against pulse_db to add proper constraints
+
+-- Add missing primary keys (from migration lines 682-706)
+DO $$
+BEGIN
+    -- Add primary keys only if they don't exist
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_clients') THEN
+        ALTER TABLE clients ADD CONSTRAINT pk_clients PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_users') THEN
+        ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_integrations') THEN
+        ALTER TABLE integrations ADD CONSTRAINT pk_integrations PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_projects') THEN
+        ALTER TABLE projects ADD CONSTRAINT pk_projects PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_issuetypes') THEN
+        ALTER TABLE issuetypes ADD CONSTRAINT pk_issuetypes PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_statuses') THEN
+        ALTER TABLE statuses ADD CONSTRAINT pk_statuses PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_issues') THEN
+        ALTER TABLE issues ADD CONSTRAINT pk_issues PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_issue_changelogs') THEN
+        ALTER TABLE issue_changelogs ADD CONSTRAINT pk_issue_changelogs PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_repositories') THEN
+        ALTER TABLE repositories ADD CONSTRAINT pk_repositories PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_pull_requests') THEN
+        ALTER TABLE pull_requests ADD CONSTRAINT pk_pull_requests PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_pull_request_commits') THEN
+        ALTER TABLE pull_request_commits ADD CONSTRAINT pk_pull_request_commits PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_pull_request_reviews') THEN
+        ALTER TABLE pull_request_reviews ADD CONSTRAINT pk_pull_request_reviews PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_pull_request_comments') THEN
+        ALTER TABLE pull_request_comments ADD CONSTRAINT pk_pull_request_comments PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_wits_prs_links') THEN
+        ALTER TABLE wits_prs_links ADD CONSTRAINT pk_wits_prs_links PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_workflows') THEN
+        ALTER TABLE workflows ADD CONSTRAINT pk_workflows PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_statuses_mappings') THEN
+        ALTER TABLE statuses_mappings ADD CONSTRAINT pk_statuses_mappings PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_wits_mappings') THEN
+        ALTER TABLE wits_mappings ADD CONSTRAINT pk_wits_mappings PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_wits_hierarchies') THEN
+        ALTER TABLE wits_hierarchies ADD CONSTRAINT pk_wits_hierarchies PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_projects_wits') THEN
+        ALTER TABLE projects_wits ADD CONSTRAINT pk_projects_wits PRIMARY KEY (project_id, wit_id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_projects_statuses') THEN
+        ALTER TABLE projects_statuses ADD CONSTRAINT pk_projects_statuses PRIMARY KEY (project_id, status_id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_job_schedules') THEN
+        ALTER TABLE job_schedules ADD CONSTRAINT pk_job_schedules PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_user_sessions') THEN
+        ALTER TABLE user_sessions ADD CONSTRAINT pk_user_sessions PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_user_permissions') THEN
+        ALTER TABLE user_permissions ADD CONSTRAINT pk_user_permissions PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_system_settings') THEN
+        ALTER TABLE system_settings ADD CONSTRAINT pk_system_settings PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_dora_market_benchmarks') THEN
+        ALTER TABLE dora_market_benchmarks ADD CONSTRAINT pk_dora_market_benchmarks PRIMARY KEY (id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pk_dora_metric_insights') THEN
+        ALTER TABLE dora_metric_insights ADD CONSTRAINT pk_dora_metric_insights PRIMARY KEY (id);
+    END IF;
+END $$;
+
+-- Add missing foreign keys (based on unified_models.py relationships)
+DO $$
+BEGIN
+    -- Users table foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_tenant_id') THEN
+        ALTER TABLE users ADD CONSTRAINT fk_users_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    -- Integrations table foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_integrations_tenant_id') THEN
+        ALTER TABLE integrations ADD CONSTRAINT fk_integrations_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    -- Projects table foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_projects_tenant_id') THEN
+        ALTER TABLE projects ADD CONSTRAINT fk_projects_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_projects_integration_id') THEN
+        ALTER TABLE projects ADD CONSTRAINT fk_projects_integration_id FOREIGN KEY (integration_id) REFERENCES integrations(id);
+    END IF;
+
+    -- Wits table foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_wits_tenant_id') THEN
+        ALTER TABLE wits ADD CONSTRAINT fk_wits_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_wits_integration_id') THEN
+        ALTER TABLE wits ADD CONSTRAINT fk_wits_integration_id FOREIGN KEY (integration_id) REFERENCES integrations(id);
+    END IF;
+
+    -- Statuses table foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_statuses_tenant_id') THEN
+        ALTER TABLE statuses ADD CONSTRAINT fk_statuses_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_statuses_integration_id') THEN
+        ALTER TABLE statuses ADD CONSTRAINT fk_statuses_integration_id FOREIGN KEY (integration_id) REFERENCES integrations(id);
+    END IF;
+
+    -- Work items table foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_work_items_tenant_id') THEN
+        ALTER TABLE work_items ADD CONSTRAINT fk_work_items_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_work_items_integration_id') THEN
+        ALTER TABLE work_items ADD CONSTRAINT fk_work_items_integration_id FOREIGN KEY (integration_id) REFERENCES integrations(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_issues_project_id') THEN
+        ALTER TABLE issues ADD CONSTRAINT fk_issues_project_id FOREIGN KEY (project_id) REFERENCES projects(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_work_items_wit_id') THEN
+        ALTER TABLE work_items ADD CONSTRAINT fk_work_items_wit_id FOREIGN KEY (wit_id) REFERENCES wits(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_work_items_status_id') THEN
+        ALTER TABLE work_items ADD CONSTRAINT fk_work_items_status_id FOREIGN KEY (status_id) REFERENCES statuses(id);
+    END IF;
+
+    -- Changelogs foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_changelogs_work_item_id') THEN
+        ALTER TABLE changelogs ADD CONSTRAINT fk_changelogs_work_item_id FOREIGN KEY (work_item_id) REFERENCES work_items(id);
+    END IF;
+
+    -- Repositories foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_repositories_tenant_id') THEN
+        ALTER TABLE repositories ADD CONSTRAINT fk_repositories_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    -- Pull requests foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_pull_requests_repository_id') THEN
+        ALTER TABLE pull_requests ADD CONSTRAINT fk_pull_requests_repository_id FOREIGN KEY (repository_id) REFERENCES repositories(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_pull_requests_issue_id') THEN
+        ALTER TABLE pull_requests ADD CONSTRAINT fk_pull_requests_issue_id FOREIGN KEY (issue_id) REFERENCES issues(id);
+    END IF;
+
+    -- Pull request related tables
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_pull_request_commits_pull_request_id') THEN
+        ALTER TABLE pull_request_commits ADD CONSTRAINT fk_pull_request_commits_pull_request_id FOREIGN KEY (pull_request_id) REFERENCES pull_requests(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_pull_request_reviews_pull_request_id') THEN
+        ALTER TABLE pull_request_reviews ADD CONSTRAINT fk_pull_request_reviews_pull_request_id FOREIGN KEY (pull_request_id) REFERENCES pull_requests(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_pull_request_comments_pull_request_id') THEN
+        ALTER TABLE pull_request_comments ADD CONSTRAINT fk_pull_request_comments_pull_request_id FOREIGN KEY (pull_request_id) REFERENCES pull_requests(id);
+    END IF;
+
+    -- Work item PR links
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_wits_prs_links_work_item_id') THEN
+        ALTER TABLE wits_prs_links ADD CONSTRAINT fk_wits_prs_links_work_item_id FOREIGN KEY (work_item_id) REFERENCES work_items(id);
+    END IF;
+
+    -- Workflows foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_workflows_tenant_id') THEN
+        ALTER TABLE workflows ADD CONSTRAINT fk_workflows_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_workflows_integration_id') THEN
+        ALTER TABLE workflows ADD CONSTRAINT fk_workflows_integration_id FOREIGN KEY (integration_id) REFERENCES integrations(id);
+    END IF;
+
+    -- Status mappings foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_status_mappings_tenant_id') THEN
+        ALTER TABLE status_mappings ADD CONSTRAINT fk_status_mappings_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_status_mappings_workflow_id') THEN
+        ALTER TABLE status_mappings ADD CONSTRAINT fk_status_mappings_workflow_id FOREIGN KEY (workflow_id) REFERENCES workflows(id);
+    END IF;
+
+    -- Wits mappings and hierarchies
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_wits_mappings_tenant_id') THEN
+        ALTER TABLE wits_mappings ADD CONSTRAINT fk_wits_mappings_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_wits_hierarchies_tenant_id') THEN
+        ALTER TABLE wits_hierarchies ADD CONSTRAINT fk_wits_hierarchies_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    -- Relationship tables
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_projects_wits_project_id') THEN
+        ALTER TABLE projects_wits ADD CONSTRAINT fk_projects_wits_project_id FOREIGN KEY (project_id) REFERENCES projects(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_projects_wits_wit_id') THEN
+        ALTER TABLE projects_wits ADD CONSTRAINT fk_projects_wits_wit_id FOREIGN KEY (wit_id) REFERENCES wits(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_projects_statuses_project_id') THEN
+        ALTER TABLE projects_statuses ADD CONSTRAINT fk_projects_statuses_project_id FOREIGN KEY (project_id) REFERENCES projects(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_projects_statuses_status_id') THEN
+        ALTER TABLE projects_statuses ADD CONSTRAINT fk_projects_statuses_status_id FOREIGN KEY (status_id) REFERENCES statuses(id);
+    END IF;
+
+    -- Job schedules foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_job_schedules_integration_id') THEN
+        ALTER TABLE job_schedules ADD CONSTRAINT fk_job_schedules_integration_id FOREIGN KEY (integration_id) REFERENCES integrations(id);
+    END IF;
+
+    -- User related tables
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_user_sessions_user_id') THEN
+        ALTER TABLE user_sessions ADD CONSTRAINT fk_user_sessions_user_id FOREIGN KEY (user_id) REFERENCES users(id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_user_permissions_user_id') THEN
+        ALTER TABLE user_permissions ADD CONSTRAINT fk_user_permissions_user_id FOREIGN KEY (user_id) REFERENCES users(id);
+    END IF;
+
+    -- System settings foreign keys
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_system_settings_tenant_id') THEN
+        ALTER TABLE system_settings ADD CONSTRAINT fk_system_settings_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+    END IF;
+
+    -- DORA tables foreign keys (if they have tenant_id)
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'dora_market_benchmarks' AND column_name = 'tenant_id') THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_dora_market_benchmarks_tenant_id') THEN
+            ALTER TABLE dora_market_benchmarks ADD CONSTRAINT fk_dora_market_benchmarks_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+        END IF;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'dora_metric_insights' AND column_name = 'tenant_id') THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_dora_metric_insights_tenant_id') THEN
+            ALTER TABLE dora_metric_insights ADD CONSTRAINT fk_dora_metric_insights_tenant_id FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+        END IF;
+    END IF;
+END $$;

@@ -1,0 +1,327 @@
+﻿# Pulse Platform - Global .gitignore
+
+# =============================================================================
+# Environment files with secrets
+# =============================================================================
+.env
+.env.local
+.env.dev
+.env.prod
+.env.development
+.env.staging
+.env.production
+.env.test
+
+# Tenant-specific environment files (NEVER COMMIT)
+.env.wex               # WEX tenant-specific configuration
+.env.techcorp          # TechCorp tenant-specific configuration
+.env.enterprise        # Enterprise tenant configuration
+
+# Legacy/backup environment files
+.env.backup            # Backup environment files
+.env.old               # Old environment files
+.env.bak               # Backup files
+
+# Service-specific environment files in root
+.env.backend           # Backend service config
+.env.etl               # ETL service config
+.env.frontend          # Frontend config
+.env.shared            # Shared config
+
+# Service-specific environment files (NEVER COMMIT)
+services/*/.env
+services/*/.env.dev
+services/*/.env.prod
+services/*/.env.local
+# Allow example/template files
+!services/*/.env.example
+
+# Safe environment files (can be committed - no secrets)
+# .env.example          # Template file - SAFE to commit
+
+# =============================================================================
+# Logs
+# =============================================================================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# =============================================================================
+# Runtime data
+# =============================================================================
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# =============================================================================
+# Coverage
+# =============================================================================
+coverage/
+*.lcov
+.nyc_output
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# =============================================================================
+# Dependency directories
+# =============================================================================
+node_modules/
+jspm_packages/
+
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+.venv/lib/
+venv/lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath
+*.sage.py
+
+# =============================================================================
+# Virtual Environments
+# =============================================================================
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder
+.spyderproject
+.spyproject
+
+# Rope
+.ropeproject
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre
+.pyre/
+
+# =============================================================================
+# Frontend / Node
+# =============================================================================
+# Next.js
+.next/
+out/
+
+# Nuxt.js
+.nuxt
+dist
+
+# Gatsby
+.cache/
+# public  # Commented out - was causing frontend/public/ to be ignored
+
+# Storybook
+.out
+.storybook-out
+
+# mkdocs
+/site
+
+# =============================================================================
+# Editors & IDEs
+# =============================================================================
+.idea/
+*.swp
+*.swo
+*~
+
+# VSCode - Allow shared workspace settings but ignore personal settings
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+.vscode/settings.local.json
+
+*.sublime-project
+*.sublime-workspace
+
+# =============================================================================
+# OS generated files
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =============================================================================
+# Docker
+# =============================================================================
+.dockerignore
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Docker volumes
+postgres-data/
+redis-data/
+
+# =============================================================================
+# Database
+# =============================================================================
+*.db
+*.sqlite
+*.sqlite3
+
+# =============================================================================
+# Secrets and keys
+# =============================================================================
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+keys/
+
+# =============================================================================
+# Compiled & binary files
+# =============================================================================
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+*.bak
+*.backup
+
+# =============================================================================
+# Compressed files (includes generated pulse-envs_*.zip backups)
+# =============================================================================
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# =============================================================================
+# Temporary folders
+# =============================================================================
+tmp/
+temp/
+
+# =============================================================================
+# Monitoring & infrastructure
+# =============================================================================
+prometheus/
+grafana/
+
+# Documentation build
+docs/_build/
+docs/build/
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Kubernetes
+*.kubeconfig
+
+# Local configuration overrides
+local.yml
+local.yaml
+local.json
+
+# =============================================================================
+# Service-specific
+# =============================================================================
+services/etl-service/logs/
+services/etl-service/.pytest_cache/
+services/ai-service/.pytest_cache/
+services/backend/dist/
+services/frontend/.next/
+services/frontend/out/
+
+# =============================================================================
+# AI and ML models (large files)
+# =============================================================================
+*.model
+*.bin
+*.h5
+*.pkl
+*.joblib
+*.safetensors
+
+# Local embedding models (downloaded via git clone) — scoped to avoid
+# catching app/models/ source directories
+services/backend/models/
+services/backend/models/sentence-transformers/all-mpnet-base-v2/
+services/backend/models/sentence-transformers/all-MiniLM-L6-v2/

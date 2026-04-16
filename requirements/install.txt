@@ -1,0 +1,17 @@
+﻿# =============================================================
+# requirements/install.txt — gus-pulse (project-level)
+# =============================================================
+# Each line is either:
+#   a FILE path  (relative to project root) -> pip install -r <file> into root .venv
+#   a DIR  path  (relative to project root) -> delegates to <dir>/scripts/setup_env.py
+#
+# Pulse runs from the project root with a single shared venv.
+# Service-level requirements are kept in requirements/*.txt
+# Lines starting with # are ignored.
+# =============================================================
+
+requirements/root.txt
+services/backend/requirements/install.txt
+services/auth/requirements/install.txt
+services/frontend/package.json
+services/frontend-etl/package.json

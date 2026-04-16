@@ -1,0 +1,6573 @@
+"""
+Jira Transform Handler - Processes Jira-specific ETL data.
+
+Handles all Jira message types:
+- jira_custom_fields: Process custom fields discovery data from createmeta API
+- jira_special_fields: Process special fields from field search API (e.g., development field)
+- jira_projects_and_issue_types: Process projects and issue types
+- jira_statuses_and_relationships: Process statuses and project relationships
+- jira_issues_with_changelogs: Process individual work items with changelogs
+- jira_dev_status: Process development status data
+"""
+
+import json
+import os
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
+from sqlalchemy import text
+from contextlib import contextmanager
+
+from app.etl.workers.bulk_operations import BulkOperations
+from app.models.unified_models import Project, Wit, CustomField
+from app.core.logging_config import get_logger
+from app.core.database import get_database, get_write_session
+from app.core.utils import DateTimeHelper
+
+logger = get_logger(__name__)
+
+
+class DateTimeEncoder(json.JSONEncoder):
+    """Custom JSON encoder that converts datetime objects to ISO format strings."""
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+
+
+class JiraTransformHandler:
+    """
+    Handler for processing Jira-specific ETL data.
+
+    This is a specialized handler (not a queue consumer) that processes
+    Jira-specific transformation logic. It's called from TransformWorker
+    which is the actual queue consumer and router.
+
+    Uses dependency injection to receive WorkerStatusManager and QueueManager.
+    """
+
+    def __init__(self, status_manager=None, queue_manager=None):
+        """
+        Initialize Jira transform handler.
+
+        Args:
+            status_manager: WorkerStatusManager instance for sending status updates (injected by router)
+            queue_manager: QueueManager instance for publishing to queues (injected by router)
+        """
+        self.database = get_database()
+        self.status_manager = status_manager  # 🔑 Dependency injection
+        self.queue_manager = queue_manager    # 🔑 Dependency injection
+        logger.debug("Initialized JiraTransformHandler")
+
+    @contextmanager
+    def get_db_session(self):
+        """
+        Get a database session with automatic cleanup.
+
+        Usage:
+            with self.get_db_session() as session:
+                # Use session for writes
+
+        Note: This uses write session context. For read-only operations,
+        consider using get_db_read_session() instead.
+        """
+        with self.database.get_write_session_context() as session:
+            yield session
+
+    @contextmanager
+    def get_db_read_session(self):
+        """
+        Get a read-only database session with automatic cleanup.
+
+        Usage:
+            with self.get_db_read_session() as session:
+                # Use session for reads only
+        """
+        with self.database.get_read_session_context() as session:
+            yield session
+
+    async def _send_worker_status(self, step: str, tenant_id: int, job_id: int,
+                                   status: str, step_type: str = None):
+        """
+        Send worker status update using injected status manager.
+
+        Args:
+            step: ETL step name (e.g., 'extraction', 'transform', 'embedding')
+            tenant_id: Tenant ID
+            job_id: Job ID
+            status: Status to send (e.g., 'running', 'finished', 'failed')
+            step_type: Optional step type for logging (e.g., 'jira_projects_and_issue_types')
+        """
+        if self.status_manager:
+            await self.status_manager.send_worker_status(
+                step=step,
+                tenant_id=tenant_id,
+                job_id=job_id,
+                status=status,
+                step_type=step_type
+            )
+        else:
+            logger.warning(f"Status manager not available - cannot send {status} status for {step_type}")
+
+    async def process_jira_message(self, message_type: str, message: Dict[str, Any]) -> bool:
+        """
+        Route Jira transform messages to appropriate handler method.
+
+        Args:
+            message_type: Type of message (e.g., 'jira_projects_and_issue_types')
+            message: Full message dict with structure:
+                {
+                    'type': str,
+                    'provider': 'jira',
+                    'tenant_id': int,
+                    'integration_id': int,
+                    'job_id': int,
+                    'raw_data_id': int | None,
+                    'token': str,
+                    'first_item': bool,
+                    'last_item': bool,
+                    'last_job_item': bool,
+                    ... other fields
+                }
+
+        Returns:
+            bool: True if processing succeeded
+        """
+        try:
+            # Extract common fields from message
+            raw_data_id = message.get('raw_data_id')
+            raw_data_ids = message.get('raw_data_ids')  # For batch messages
+            tenant_id = message.get('tenant_id')
+            integration_id = message.get('integration_id')
+            job_id = message.get('job_id')
+            first_item = message.get('first_item', False)
+            last_item = message.get('last_item', False)
+            token = message.get('token')
+
+            logger.debug(f"🔄 [JIRA] Processing {message_type} for raw_data_id={raw_data_id}, raw_data_ids={raw_data_ids} (first={first_item}, last={last_item})")
+
+            # 🎯 HANDLE COMPLETION MESSAGE: raw_data_id=None AND raw_data_ids=None signals completion
+            if raw_data_id is None and raw_data_ids is None:
+                logger.debug(f"🎯 [COMPLETION] Received completion message for {message_type}")
+                return await self._handle_completion_message(message_type, message)
+
+            # Route to appropriate handler based on message type
+            if message_type == 'jira_custom_field_single':
+                return await self._process_single_custom_field(raw_data_id, tenant_id, integration_id, message)
+            elif message_type == 'jira_custom_fields':
+                return await self._process_jira_custom_fields(raw_data_id, tenant_id, integration_id, message)
+            elif message_type == 'jira_special_fields':
+                return self._process_jira_special_fields(raw_data_id, tenant_id, integration_id)
+            elif message_type == 'jira_projects_and_issue_types':
+                return await self._process_jira_project_search(raw_data_id, tenant_id, integration_id, job_id, message)
+            elif message_type == 'jira_statuses_and_relationships':
+                return await self._process_jira_statuses_and_project_relationships(raw_data_id, tenant_id, integration_id, job_id, message)
+            elif message_type == 'jira_issues_with_changelogs':
+                return await self._process_jira_single_issue_changelog(raw_data_id, tenant_id, integration_id, job_id, message)
+            elif message_type == 'jira_dev_status':
+                return await self._process_jira_dev_status(raw_data_id, tenant_id, integration_id, job_id, message)
+            elif message_type == 'jira_sprint_reports':
+                return await self._process_jira_sprint_reports(raw_data_id, tenant_id, integration_id, job_id, message)
+            elif message_type == 'config_projects_and_issue_types':
+                # Config job step 1: Projects & Types (transform only - reuses Jira logic)
+                return await self._process_config_projects_and_issue_types(tenant_id, integration_id, job_id, message)
+            elif message_type == 'config_statuses_and_relations':
+                # Config job step 2: Statuses & Relations (transform only - reuses Jira logic)
+                return await self._process_config_statuses_and_relations(tenant_id, integration_id, job_id, message)
+            elif message_type == 'config_wit_hierarchies':
+                # Config job step 3: WIT Hierarchies (transform only)
+                return await self._process_config_wit_hierarchies(tenant_id, integration_id, job_id, message)
+            elif message_type == 'config_wit_mappings':
+                # Config job step 4: WIT Mappings (transform only)
+                return await self._process_config_wit_mappings(tenant_id, integration_id, job_id, message)
+            elif message_type == 'config_status_mappings':
+                # Config job step 5: Status Mappings (transform only)
+                return await self._process_config_status_mappings(tenant_id, integration_id, job_id, message)
+            elif message_type == 'config_workflows':
+                # Config job step 6: Workflows (transform only)
+                return await self._process_config_workflows(tenant_id, integration_id, job_id, message)
+            elif message_type == 'config_custom_fields_batch':
+                # Config job step 7: Custom fields (BATCH MODE)
+                # Message contains raw_data_ids array with ordered records to process
+                return await self._process_config_custom_fields_batch(tenant_id, integration_id, message)
+            else:
+                logger.warning(f"Unknown Jira message type: {message_type}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error processing Jira message type {message_type}: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    # ============ COMPLETION MESSAGE HANDLING ============
+
+    async def _handle_completion_message(self, message_type: str, message: Dict[str, Any]) -> bool:
+        """
+        Handle completion messages (raw_data_id=None) for Jira transform steps.
+
+        Args:
+            message_type: Type of completion message
+            message: Full message dict
+
+        Returns:
+            bool: True if completion message handled successfully
+        """
+        tenant_id = message.get('tenant_id')
+        job_id = message.get('job_id')
+        integration_id = message.get('integration_id')
+        last_item = message.get('last_item', False)
+        token = message.get('token')
+
+        # Send WebSocket status: transform worker finished (on last_item)
+        if last_item and job_id:
+            try:
+                await self._send_worker_status("transform", tenant_id, job_id, "finished", message_type)
+                logger.debug(f"✅ Transform worker marked as finished for {message_type} (completion message)")
+            except Exception as e:
+                logger.error(f"❌ Error sending finished status for {message_type}: {e}")
+
+        # Handle different completion message types
+        if message_type == 'jira_dev_status':
+            logger.debug(f"🎯 [COMPLETION] Processing jira_dev_status completion message")
+            self._queue_entities_for_embedding(
+                tenant_id=tenant_id,
+                table_name='work_items_prs_links',
+                entities=[],  # Empty list - signals completion
+                job_id=job_id,
+                message_type='jira_dev_status',
+                integration_id=integration_id,
+                provider=message.get('provider', 'jira'),
+                last_sync_date=message.get('last_sync_date'),
+                first_item=message.get('first_item', False),
+                last_item=message.get('last_item', False),
+                last_job_item=message.get('last_job_item', False),
+                token=token
+            )
+            logger.debug(f"🎯 [COMPLETION] jira_dev_status completion message forwarded to embedding")
+            return True
+
+        elif message_type == 'jira_issues_with_changelogs' or message_type == 'jira_issues_with_changelogs_completion':
+            logger.debug(f"🎯 [COMPLETION] Processing {message_type} completion message")
+
+            # 🔑 Send "finished" status for transform step
+            if message.get('last_item'):
+                logger.info(f"🏁 [ISSUES-COMPLETION] Sending 'finished' status for transform step")
+                await self._send_worker_status('transform', tenant_id, job_id, 'finished', 'jira_issues_with_changelogs')
+                logger.info(f"✅ [ISSUES-COMPLETION] Transform step marked as finished")
+
+            # Forward completion message to embedding
+            self._queue_entities_for_embedding(
+                tenant_id=tenant_id,
+                table_name='work_items',
+                entities=[],  # Empty list - signals completion
+                job_id=job_id,
+                message_type='jira_issues_with_changelogs',
+                integration_id=integration_id,
+                provider=message.get('provider', 'jira'),
+                old_last_sync_date=message.get('old_last_sync_date'),
+                new_last_sync_date=message.get('new_last_sync_date'),
+                first_item=message.get('first_item', False),
+                last_item=message.get('last_item', False),
+                last_job_item=message.get('last_job_item', False),
+                token=token
+            )
+            logger.debug(f"🎯 [COMPLETION] {message_type} completion message forwarded to embedding")
+            return True
+
+        elif message_type == 'jira_sprint_reports':
+            logger.debug(f"🎯 [COMPLETION] Processing jira_sprint_reports completion message")
+            self._queue_entities_for_embedding(
+                tenant_id=tenant_id,
+                table_name='sprints',
+                entities=[],  # Empty list - signals completion
+                job_id=job_id,
+                message_type='jira_sprint_reports',
+                integration_id=integration_id,
+                provider=message.get('provider', 'jira'),
+                last_sync_date=message.get('last_sync_date'),
+                first_item=message.get('first_item', False),
+                last_item=message.get('last_item', False),
+                last_job_item=message.get('last_job_item', False),
+                token=token
+            )
+            logger.debug(f"🎯 [COMPLETION] jira_sprint_reports completion message forwarded to embedding")
+            return True
+
+        # Config job completion messages (steps 1-6: no extraction phase, early closure)
+        elif message_type in ['config_projects_and_issue_types', 'config_statuses_and_relations', 'config_wit_hierarchies', 'config_wit_mappings', 'config_status_mappings', 'config_workflows']:
+            logger.debug(f"🎯 [COMPLETION] Processing {message_type} completion message (early closure)")
+            # These steps have no extraction phase - they go straight to transform
+            # Transform worker sends both "transform finished" and "embedding finished" (early closure)
+            # No need to forward to embedding worker
+            return True
+
+        else:
+            logger.warning(f"⚠️ [COMPLETION] Unknown Jira completion message type: {message_type}")
+            return False
+
+    # ============ JIRA PROCESSING METHODS ============
+    # All Jira-specific processing methods extracted from transform_worker.py
+
+    async def _process_jira_project_search(self, raw_data_id: int, tenant_id: int, integration_id: int, job_id: int = None, message: Dict[str, Any] = None) -> bool:
+        """
+        Process Jira projects and issue types from raw_extraction_data.
+
+        This method:
+        1. Retrieves raw project data from raw_extraction_data table
+        2. Processes projects and issue types
+        3. Saves to projects and wits tables
+        4. Creates project-wit relationships
+        5. Queues entities for embedding
+
+        Args:
+            raw_data_id: ID of the raw data record
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            job_id: ETL job ID
+            message: Full message dict with flags (must include 'type' field for step name)
+
+        Returns:
+            bool: True if processing succeeded
+        """
+        try:
+            # Extract message flags and step name
+            first_item = message.get('first_item', False) if message else False
+            last_item = message.get('last_item', False) if message else False
+            step_name = message.get('type', 'jira_projects_and_issue_types') if message else 'jira_projects_and_issue_types'
+            last_job_item = message.get('last_job_item', False) if message else False
+            provider = message.get('provider', 'jira') if message else 'jira'
+            old_last_sync_date = message.get('old_last_sync_date') if message else None  # 🔑 From extraction worker
+            new_last_sync_date = message.get('new_last_sync_date') if message else None
+            token = message.get('token') if message else None
+
+            logger.info(f"🔄 Processing jira_projects_and_issue_types (raw_data_id={raw_data_id}, first={first_item}, last={last_item})")
+
+            database = get_database()
+
+            # Fetch raw data
+            with database.get_read_session_context() as db:
+                query = text("""
+                    SELECT raw_data
+                    FROM raw_extraction_data
+                    WHERE id = :raw_data_id
+                """)
+                result = db.execute(query, {'raw_data_id': raw_data_id}).fetchone()
+
+                if not result or not result[0]:
+                    logger.error(f"No raw data found for raw_data_id={raw_data_id}")
+                    return False
+
+                projects_data = result[0]  # This is already a list from JSONB
+
+            if not isinstance(projects_data, list):
+                logger.error(f"Expected list of projects, got {type(projects_data)}")
+                return False
+
+            logger.debug(f"📊 Found {len(projects_data)} projects to process")
+
+            # Process projects and issue types
+            with database.get_write_session_context() as db:
+                # Get existing data
+                existing_projects = self._get_existing_projects(db, tenant_id, integration_id)
+                existing_wits = self._get_existing_wits(db, tenant_id, integration_id)
+                existing_relationships = self._get_existing_project_wit_relationships(db, tenant_id)
+
+                # Accumulators for bulk operations
+                projects_to_insert = []
+                projects_to_update = []
+                wits_to_insert = []
+                wits_to_update = []
+                project_wit_relationships = []
+
+                # Process each project
+                for project_data in projects_data:
+                    result = self._process_project_data(
+                        project_data, tenant_id, integration_id,
+                        existing_projects, existing_wits, {},  # No custom fields for project search
+                        existing_relationships, {}  # No global custom fields
+                    )
+
+                    projects_to_insert.extend(result.get('projects_to_insert', []))
+                    projects_to_update.extend(result.get('projects_to_update', []))
+                    wits_to_insert.extend(result.get('wits_to_insert', []))
+                    wits_to_update.extend(result.get('wits_to_update', []))
+                    project_wit_relationships.extend(result.get('project_wit_relationships', []))
+
+                # Perform bulk operations
+                self._perform_bulk_operations(
+                    db, projects_to_insert, projects_to_update,
+                    wits_to_insert, wits_to_update,
+                    [], [],  # No custom fields for project search
+                    project_wit_relationships
+                )
+
+                # Note: project-wit relationships are handled by _perform_bulk_operations
+
+                db.commit()
+                logger.debug(f"✅ Committed projects and issue types to database")
+
+            # Queue entities for embedding (after commit)
+            # 🚀 PERFORMANCE: Use shared channel to queue projects and WITs individually (same pattern as extraction worker)
+            has_projects = bool(projects_to_insert or projects_to_update)
+            has_wits = bool(wits_to_insert or wits_to_update)
+
+            import pika
+            import json
+
+            # 🔧 FIX: Check for entities that need embedding but weren't inserted/updated
+            # This handles the case where entities exist in DB but not in qdrant_vectors (first run scenario)
+            all_projects = projects_to_insert + projects_to_update if has_projects else []
+            all_wits = wits_to_insert + wits_to_update if has_wits else []
+
+            # Add existing entities that don't have vectors yet
+            unembedded_projects = self._get_unembedded_entities(tenant_id, integration_id, 'projects')
+            unembedded_wits = self._get_unembedded_entities(tenant_id, integration_id, 'wits')
+
+            # Merge with existing lists, avoiding duplicates
+            all_projects = self._merge_entity_lists(all_projects, unembedded_projects)
+            all_wits = self._merge_entity_lists(all_wits, unembedded_wits)
+
+            # 🚀 Queue projects and WITs in SEPARATE batches of 100
+            BATCH_SIZE = 100
+
+            # Queue projects first
+            if all_projects:
+                total_project_batches = (len(all_projects) + BATCH_SIZE - 1) // BATCH_SIZE
+                logger.info(f"📦 [PROJECTS] Batching {len(all_projects)} projects into {total_project_batches} batches of {BATCH_SIZE}")
+
+                for batch_idx in range(total_project_batches):
+                    start_idx = batch_idx * BATCH_SIZE
+                    end_idx = min(start_idx + BATCH_SIZE, len(all_projects))
+                    batch_projects = all_projects[start_idx:end_idx]
+
+                    # Build entities list for batch
+                    batch_entities = [{'external_id': p.get('external_id')} for p in batch_projects]
+
+                    is_first = (batch_idx == 0)
+                    is_last = (batch_idx == total_project_batches - 1)
+
+                    logger.info(f"📤 [PROJECTS] Queuing batch {batch_idx + 1}/{total_project_batches}: {len(batch_entities)} projects, first={is_first}, last={is_last}")
+
+                    self._queue_entities_for_embedding(
+                        tenant_id=tenant_id,
+                        table_name='projects',
+                        entities=batch_entities,
+                        job_id=job_id,
+                        message_type=step_name,
+                        integration_id=integration_id,
+                        provider=provider,
+                        old_last_sync_date=old_last_sync_date,
+                        new_last_sync_date=new_last_sync_date,
+                        first_item=is_first,
+                        last_item=is_last,
+                        last_job_item=False,
+                        token=token
+                    )
+
+                logger.info(f"✅ [PROJECTS] Queued {len(all_projects)} projects in {total_project_batches} batches to embedding")
+
+            # Queue WITs second
+            if all_wits:
+                total_wit_batches = (len(all_wits) + BATCH_SIZE - 1) // BATCH_SIZE
+                logger.info(f"📦 [WITS] Batching {len(all_wits)} WITs into {total_wit_batches} batches of {BATCH_SIZE}")
+
+                for batch_idx in range(total_wit_batches):
+                    start_idx = batch_idx * BATCH_SIZE
+                    end_idx = min(start_idx + BATCH_SIZE, len(all_wits))
+                    batch_wits = all_wits[start_idx:end_idx]
+
+                    # Build entities list for batch
+                    batch_entities = [{'external_id': w.get('external_id')} for w in batch_wits]
+
+                    is_first = (batch_idx == 0)
+                    is_last = (batch_idx == total_wit_batches - 1)
+
+                    logger.info(f"📤 [WITS] Queuing batch {batch_idx + 1}/{total_wit_batches}: {len(batch_entities)} WITs, first={is_first}, last={is_last}")
+
+                    self._queue_entities_for_embedding(
+                        tenant_id=tenant_id,
+                        table_name='wits',
+                        entities=batch_entities,
+                        job_id=job_id,
+                        message_type=step_name,
+                        integration_id=integration_id,
+                        provider=provider,
+                        old_last_sync_date=old_last_sync_date,
+                        new_last_sync_date=new_last_sync_date,
+                        first_item=is_first,
+                        last_item=is_last,
+                        last_job_item=False,
+                        token=token
+                    )
+
+                logger.info(f"✅ [WITS] Queued {len(all_wits)} WITs in {total_wit_batches} batches to embedding")
+
+            # 🎯 HANDLE NO UPDATES: If no projects and no WITs, mark both transform and embedding as finished
+            if not has_projects and not has_wits and last_item:
+                logger.info(f"🎯 [PROJECTS] No updates found - marking transform and embedding as finished")
+
+                # 🎯 OPTION 1: Mark both steps as finished directly (current approach)
+                # This avoids sending unnecessary completion messages through the queue
+                await self._send_worker_status('transform', tenant_id, job_id, 'finished', step_name)
+                await self._send_worker_status('embedding', tenant_id, job_id, 'finished', step_name)
+                logger.debug(f"✅ [PROJECTS] Both transform and embedding steps marked as finished (no data to process)")
+
+                # 🎯 OPTION 2: Send completion message to embedding (uncomment if you want the message to flow through embedding worker)
+                # self._queue_entities_for_embedding(
+                #     tenant_id=tenant_id,
+                #     table_name='projects',  # Use projects table as the step identifier
+                #     entities=[],  # Empty list signals completion
+                #     job_id=job_id,
+                #     message_type='jira_projects_and_issue_types',
+                #     integration_id=integration_id,
+                #     provider=provider,
+                #     old_last_sync_date=old_last_sync_date,
+                #     new_last_sync_date=new_last_sync_date,
+                #     first_item=first_item,  # Preserve first_item flag
+                #     last_item=last_item,  # Preserve last_item flag
+                #     last_job_item=last_job_item,  # Preserve last_job_item flag
+                #     token=token
+                # )
+                # logger.debug(f"✅ [PROJECTS] Completion message sent to embedding (no data to process)")
+            # ✅ Send WebSocket status update when last_item=True (only if we have data to process)
+            elif last_item and job_id:
+                logger.info(f"🏁 [PROJECTS] Sending 'finished' status for transform step ({step_name})")
+                await self._send_worker_status('transform', tenant_id, job_id, 'finished', step_name)
+                logger.debug(f"✅ [PROJECTS] Transform step marked as finished and WebSocket notification sent")
+
+            logger.info(f"✅ [PROJECTS] Completed projects and issue types processing (raw_data_id={raw_data_id})")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing jira_projects_and_issue_types: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+
+    async def _process_single_custom_field(
+        self,
+        raw_data_id: int,
+        tenant_id: int,
+        integration_id: int,
+        message: Dict[str, Any]
+    ) -> bool:
+        """
+        Process a SINGLE custom field (new approach to avoid deadlocks).
+        This creates/updates one custom field and queues it for embedding.
+
+        This is the NEW approach that processes fields individually like projects/WITs
+        to avoid deadlocks when multiple workers process the same fields.
+
+        Args:
+            raw_data_id: ID of the raw_extraction_data record containing the field
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            message: Message containing first_item/last_item flags
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            import traceback
+            from datetime import datetime, timezone
+
+            # Extract flags from message
+            first_item = message.get('first_item', False)
+            last_item = message.get('last_item', False)
+            last_job_item = message.get('last_job_item', False)
+            job_id = message.get('job_id')
+
+            # Note: "transform running" status is sent by TransformWorkerRouter, not here (avoids duplicate status updates)
+
+            # Get raw data
+            with self.get_db_session() as session:
+                raw_data = self._get_raw_data(session, raw_data_id)
+                if not raw_data:
+                    logger.error(f"No raw data found for ID {raw_data_id}")
+                    return False
+
+                # Extract field data (it's a single field object, not a list)
+                field = raw_data
+                field_id = field.get('id')
+                field_name = field.get('name', 'Unknown')
+
+                logger.debug(f"Processing single custom field: {field_id} - {field_name}")
+
+                # Transform field data
+                field_type = field.get('schema', {}).get('type', 'string')
+                if field.get('schema', {}).get('items'):
+                    field_type = 'array'
+
+                operations = field.get('schema', {}).get('operations', [])
+                if operations:
+                    operations = ','.join(operations) if isinstance(operations, list) else str(operations)
+
+                # UPSERT the custom field
+                try:
+                    upsert_query = text("""
+                        INSERT INTO custom_fields (
+                            external_id, name, field_type, operations,
+                            tenant_id, integration_id, created_at, last_updated_at
+                        ) VALUES (
+                            :external_id, :name, :field_type, :operations,
+                            :tenant_id, :integration_id, :created_at, :last_updated_at
+                        )
+                        ON CONFLICT (tenant_id, integration_id, external_id)
+                        DO UPDATE SET
+                            name = EXCLUDED.name,
+                            field_type = EXCLUDED.field_type,
+                            operations = EXCLUDED.operations,
+                            last_updated_at = EXCLUDED.last_updated_at
+                        RETURNING id
+                    """)
+
+                    now = datetime.now(timezone.utc)
+
+                    result = session.execute(upsert_query, {
+                        'external_id': field_id,
+                        'name': field_name,
+                        'field_type': field_type,
+                        'operations': operations,
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id,
+                        'created_at': now,
+                        'last_updated_at': now
+                    })
+
+                    row = result.fetchone()
+                    if row:
+                        custom_field_db_id = row[0]
+                        logger.debug(f"✅ Upserted custom field {field_id} with DB ID {custom_field_db_id}")
+                    else:
+                        logger.error(f"Failed to upsert custom field {field_id}")
+                        return False
+
+                    # Update raw data status
+                    self._update_raw_data_status(session, raw_data_id, 'completed')
+
+                    session.commit()
+
+                except Exception as e:
+                    session.rollback()
+                    logger.error(f"Error upserting custom field {field_id}: {e}")
+                    import traceback
+                    logger.error(f"Full traceback: {traceback.format_exc()}")
+                    return False
+
+            # Queue for embedding (like projects/WITs)
+            # Forward all flags to embedding worker
+            self._queue_entities_for_embedding(
+                tenant_id=tenant_id,
+                integration_id=integration_id,
+                table_name='custom_fields',
+                entities=[{'external_id': field_id}],
+                job_id=job_id,  # 🔑 Include job_id for status updates
+                first_item=first_item,
+                last_item=last_item,
+                last_job_item=last_job_item,  # Forward last_job_item flag
+                provider='jira',
+                message_type='config_custom_fields'  # 🔑 Include step type for status tracking
+            )
+
+            logger.debug(f"✅ Queued custom field {field_id} for embedding (first={first_item}, last={last_item}, last_job={last_job_item})")
+
+            # Send transform worker "finished" status when last_item=True (job-based status system)
+            if last_item and job_id:
+                await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_custom_fields")
+
+            return True
+
+        except Exception as e:
+            import traceback
+            logger.error(f"Error processing single custom field: {e}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_jira_custom_fields(
+        self,
+        raw_data_id: int,
+        tenant_id: int,
+        integration_id: int,
+        message: Dict[str, Any]
+    ) -> bool:
+        """
+        Process Jira custom fields data from createmeta API response (Step 2).
+        This ONLY creates project-field relationships in custom_fields_projects table.
+
+        NEW APPROACH: Custom fields are already processed individually by Step 1.
+        This method now ONLY handles the junction table relationships (like projects_wits).
+
+        Creates:
+        - Custom Fields-Projects relationships (junction table ONLY)
+
+        Does NOT create/update:
+        - Custom Fields (handled by Step 1: jira_custom_field_single)
+        - Projects (handled by jira_projects_and_issue_types)
+        - WITs (handled by jira_projects_and_issue_types)
+
+        Args:
+            raw_data_id: ID of raw_extraction_data record
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            message: Message containing first_item/last_item/last_job_item flags
+
+        Returns:
+            bool: True if processing succeeded
+        """
+        try:
+            # Extract flags from message
+            first_item = message.get('first_item', False)
+            last_item = message.get('last_item', False)
+            last_job_item = message.get('last_job_item', False)
+            job_id = message.get('job_id')
+
+            # Note: "transform running" status is sent by TransformWorkerRouter, not here (avoids duplicate status updates)
+
+            with self.get_db_session() as session:
+                # 1. Get raw data
+                raw_data = self._get_raw_data(session, raw_data_id)
+                if not raw_data:
+                    logger.error(f"Raw data not found: {raw_data_id}")
+                    return False
+
+                # 2. Parse createmeta response
+                createmeta_response = raw_data
+                projects_data = createmeta_response.get('values', createmeta_response.get('projects', []))
+
+                if not projects_data:
+                    logger.warning(f"No projects found in raw data: {raw_data_id}")
+                    return True  # Not an error, just empty data
+
+                logger.info(f"Processing custom field relationships for {len(projects_data)} projects from createmeta")
+
+                # 3. Extract custom field-project relationships ONLY
+                custom_field_project_relationships = []
+
+                for project_data in projects_data:
+                    project_key = project_data.get('key')
+                    if not project_key:
+                        continue
+
+                    # Get issue types for this project
+                    issue_types = project_data.get('issueTypes', project_data.get('issuetypes', []))
+
+                    # Collect all custom fields across all issue types for this project
+                    project_custom_fields = set()
+                    for issue_type in issue_types:
+                        fields = issue_type.get('fields', {})
+                        for field_key, field_info in fields.items():
+                            # Only process custom fields (start with 'customfield_')
+                            if field_key.startswith('customfield_'):
+                                project_custom_fields.add(field_key)
+
+                    # Create relationship entries
+                    for field_id in project_custom_fields:
+                        custom_field_project_relationships.append({
+                            'custom_field_external_id': field_id,
+                            'project_key': project_key
+                        })
+
+                logger.info(f"Extracted {len(custom_field_project_relationships)} custom field-project relationships")
+
+                # 4. Create custom field-project relationships (junction table ONLY)
+                if custom_field_project_relationships:
+                    cf_relationships_created = self._create_custom_field_project_relationships(
+                        session, custom_field_project_relationships, tenant_id, integration_id
+                    )
+                    logger.info(f"Created {cf_relationships_created} custom field-project relationships")
+
+                # 5. Update raw data status
+                self._update_raw_data_status(session, raw_data_id, 'completed')
+
+                # Commit all changes
+                session.commit()
+
+                logger.info(f"Successfully processed custom field relationships for raw_data_id={raw_data_id}")
+
+            # Send transform worker "finished" status when last_item=True (job-based status system)
+            # Note: Junction tables are NOT embedded, so we send completion directly
+            if last_item and job_id:
+                await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_custom_fields")
+
+            # If this is the last job item, send a completion message to embedding queue
+            # This triggers the embedding worker to send the completion event
+            if last_job_item:
+                logger.info(f"Last job item - sending completion message to embedding queue")
+                self._queue_entities_for_embedding(
+                    tenant_id=tenant_id,
+                    integration_id=integration_id,
+                    table_name='custom_fields',
+                    entities=[],  # Empty list - this is just a completion signal
+                    first_item=False,
+                    last_item=True,
+                    last_job_item=True,
+                    provider='jira'
+                )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing Jira custom field relationships: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_config_custom_fields_createmeta(
+        self,
+        raw_data_id: int,
+        tenant_id: int,
+        integration_id: int,
+        message: Dict[str, Any]
+    ) -> bool:
+        """
+        Process createmeta for Config job custom fields (Step 1b).
+
+        This method:
+        1. Creates custom_fields_projects relationships for each project
+        2. When last_item=True (last project):
+           - Creates custom_fields_mappings using .env keys
+           - Sends transform "finished" status
+           - Sends embedding "finished" status (early closure - no embedding)
+
+        Args:
+            raw_data_id: ID of raw_extraction_data record
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            message: Message containing first_item/last_item/last_job_item flags
+
+        Returns:
+            bool: True if processing succeeded
+        """
+        try:
+            # Extract flags from message
+            first_item = message.get('first_item', False)
+            last_item = message.get('last_item', False)
+            last_job_item = message.get('last_job_item', False)
+            job_id = message.get('job_id')
+
+            logger.info(f"🏁 [CONFIG] Processing createmeta (first={first_item}, last={last_item}, last_job={last_job_item})")
+
+            with self.get_db_session() as session:
+                # Get raw data
+                raw_data = self._get_raw_data(session, raw_data_id)
+                if not raw_data:
+                    logger.error(f"Raw data not found: {raw_data_id}")
+                    return False
+
+                # Parse createmeta response
+                project_key = raw_data.get('project_key')
+                createmeta = raw_data.get('createmeta')
+                projects_data = createmeta.get('values', createmeta.get('projects', []))
+
+                if not projects_data:
+                    logger.warning(f"No projects found in createmeta for project_key={project_key}")
+                    return True  # Not an error, just empty data
+
+                logger.info(f"Processing {len(projects_data)} projects from createmeta")
+
+                # Step 1: Get existing projects for this integration
+                existing_projects_query = session.query(Project).filter(
+                    Project.tenant_id == tenant_id,
+                    Project.integration_id == integration_id
+                ).all()
+                existing_projects = {p.external_id: p for p in existing_projects_query}
+
+                # Step 2: Process each project - create/update project data
+                projects_to_insert = []
+                projects_to_update = []
+
+                for project_data in projects_data:
+                    project_external_id = project_data.get('id')
+                    proj_key = project_data.get('key')
+                    proj_name = project_data.get('name')
+
+                    if not project_external_id or not proj_key:
+                        logger.warning(f"Skipping project with missing id or key: {project_data}")
+                        continue
+
+                    # Check if project exists
+                    if project_external_id in existing_projects:
+                        # Update existing project (minimal update - only key if changed)
+                        existing_project = existing_projects[project_external_id]
+                        if existing_project.key != proj_key:
+                            projects_to_update.append({
+                                'id': existing_project.id,
+                                'external_id': project_external_id,
+                                'key': proj_key,
+                                'last_updated_at': DateTimeHelper.now_default()
+                            })
+                            logger.debug(f"Project {proj_key} will be updated (key changed)")
+                    else:
+                        # Create new project (minimal insert - will be updated by Jira job)
+                        projects_to_insert.append({
+                            'external_id': project_external_id,
+                            'key': proj_key,
+                            'name': proj_name or 'Pending',  # Placeholder to satisfy NOT NULL constraint
+                            'project_type': None,  # Will be filled by Jira job
+                            'tenant_id': tenant_id,
+                            'integration_id': integration_id,
+                            'active': True,
+                            'created_at': DateTimeHelper.now_default(),
+                            'last_updated_at': DateTimeHelper.now_default()
+                        })
+                        logger.debug(f"Project {proj_key} will be created")
+
+                # Step 3: Bulk insert/update projects
+                if projects_to_insert:
+                    BulkOperations.bulk_insert(session, 'projects', projects_to_insert)
+                    logger.info(f"Inserted {len(projects_to_insert)} new projects")
+
+                if projects_to_update:
+                    BulkOperations.bulk_update(session, 'projects', projects_to_update)
+                    logger.info(f"Updated {len(projects_to_update)} projects")
+
+                # Step 4: Extract custom field-project relationships
+                custom_field_project_relationships = []
+
+                for project_data in projects_data:
+                    proj_key = project_data.get('key')
+                    if not proj_key:
+                        continue
+
+                    # Get issue types for this project
+                    issue_types = project_data.get('issueTypes', project_data.get('issuetypes', []))
+
+                    # Collect all custom fields across all issue types for this project
+                    project_custom_fields = set()
+                    for issue_type in issue_types:
+                        fields = issue_type.get('fields', {})
+                        for field_key, field_info in fields.items():
+                            # Only process custom fields (start with 'customfield_')
+                            if field_key.startswith('customfield_'):
+                                project_custom_fields.add(field_key)
+
+                    # Create relationship entries
+                    for field_id in project_custom_fields:
+                        custom_field_project_relationships.append({
+                            'custom_field_external_id': field_id,
+                            'project_key': proj_key
+                        })
+
+                logger.info(f"Extracted {len(custom_field_project_relationships)} custom field-project relationships")
+
+                # Step 5: Create custom field-project relationships
+                if custom_field_project_relationships:
+                    cf_relationships_created = self._create_custom_field_project_relationships(
+                        session, custom_field_project_relationships, tenant_id, integration_id
+                    )
+                    logger.info(f"Created {cf_relationships_created} custom field-project relationships")
+
+                # Update raw data status
+                self._update_raw_data_status(session, raw_data_id, 'completed')
+
+                # When last_item=True (last project), create custom_fields_mappings
+                if last_item:
+                    logger.info(f"📋 Last project - creating custom_fields_mappings using .env keys")
+
+                    # Auto-map special fields
+                    special_field_mappings = {
+                        'JIRA_TEAM_FIELD_ID': 'team_field_id',
+                        'JIRA_DEVELOPMENT_FIELD_ID': 'development_field_id',
+                        'JIRA_SPRINTS_FIELD_ID': 'sprints_field_id',
+                        'JIRA_STORY_POINTS_FIELD_ID': 'story_points_field_id',
+                        'JIRA_ACCEPTANCE_CRITERIA_FIELD_ID': 'acceptance_criteria_field_id'
+                    }
+
+                    for env_var, mapping_column in special_field_mappings.items():
+                        field_external_id = os.getenv(env_var)
+                        if field_external_id:
+                            self._auto_map_special_field(session, tenant_id, integration_id, field_external_id, mapping_column)
+
+                    # Auto-map custom field columns (custom_field_01 through custom_field_20)
+                    for i in range(1, 21):
+                        env_var_name = f"JIRA_CUSTOM_FIELD_{i:02d}_ID"
+                        custom_field_external_id = os.getenv(env_var_name)
+
+                        if custom_field_external_id:
+                            mapping_column = f"custom_field_{i:02d}_id"
+                            self._auto_map_special_field(session, tenant_id, integration_id, custom_field_external_id, mapping_column)
+
+                    logger.info(f"✅ Custom fields mappings created successfully")
+
+                # Commit all changes
+                session.commit()
+
+                logger.info(f"Successfully processed createmeta for raw_data_id={raw_data_id}")
+
+            # When last_item=True, send transform "finished" status
+            # NOTE: Do NOT send "embedding finished" here - the individual custom fields
+            # are being embedded by _process_single_custom_field(), and the embedding worker
+            # will send "embedding finished" when the last custom field is processed
+            if last_item and job_id:
+                # Send transform "finished" status
+                await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_custom_fields")
+
+                logger.info(f"✅ [CONFIG] Custom fields createmeta processing completed (transform finished, waiting for embedding)")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing createmeta: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_config_custom_fields_batch(
+        self, tenant_id: int, integration_id: int, message: Dict[str, Any]
+    ) -> bool:
+        """
+        Process custom fields in BATCH MODE for Config job.
+
+        This method processes multiple raw_data records in sequence:
+        1. all_custom_fields: Bulk UPSERT all custom fields
+        2. createmeta_batch_1, createmeta_batch_2, ...: Process project relationships
+
+        Message structure:
+        {
+            'raw_data_ids': [123, 124, 125],  # Ordered array: [all_fields, batch1, batch2]
+            'tenant_id': 1,
+            'integration_id': 1,
+            'job_id': 5,
+            'first_item': True,
+            'last_item': True,
+            'token': 'abc123'
+        }
+
+        Args:
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            message: Message containing raw_data_ids array
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            job_id = message.get('job_id')
+            raw_data_ids = message.get('raw_data_ids', [])
+            first_item = message.get('first_item', False)
+            last_item = message.get('last_item', False)
+            last_job_item = message.get('last_job_item', False)
+            token = message.get('token')
+
+            if not raw_data_ids:
+                logger.error(f"No raw_data_ids in batch message")
+                return False
+
+            # Note: "transform running" status is sent by TransformWorkerRouter, not here (avoids duplicate status updates)
+
+            logger.info(f"🔄 [BATCH] Processing {len(raw_data_ids)} raw_data records in sequence")
+
+            # Track changed and all custom field IDs for embedding
+            changed_custom_field_ids = []
+            all_custom_field_ids = []
+
+            # Process each raw_data record in order
+            with self.get_db_session() as session:
+                for i, raw_data_id in enumerate(raw_data_ids):
+                    logger.info(f"📋 [BATCH] Processing raw_data_id={raw_data_id} ({i+1}/{len(raw_data_ids)})")
+
+                    # Fetch raw data
+                    raw_data = self._get_raw_data(session, raw_data_id)
+                    if not raw_data:
+                        logger.error(f"Raw data not found for ID {raw_data_id}")
+                        continue
+
+                    data_type = raw_data.get('type')
+
+                    if data_type == 'all_custom_fields':
+                        # Process all custom fields in bulk with change detection
+                        logger.info(f"🔄 [BATCH] Processing all_custom_fields (bulk UPSERT with change detection)")
+                        changed_ids, all_ids = await self._process_all_custom_fields_bulk(
+                            session, tenant_id, integration_id, raw_data
+                        )
+                        changed_custom_field_ids.extend(changed_ids)
+                        all_custom_field_ids.extend(all_ids)
+                        logger.info(f"✅ [BATCH] Bulk UPSERT completed: {len(changed_ids)} changed, {len(all_ids)} total")
+
+                    elif data_type == 'createmeta_batch':
+                        # Process createmeta batch (project relationships + mappings)
+                        batch_num = raw_data.get('batch_number', i)
+                        project_keys = raw_data.get('project_keys', [])
+                        logger.info(f"🔄 [BATCH] Processing createmeta_batch {batch_num} for projects: {project_keys}")
+
+                        await self._process_createmeta_batch(
+                            session, tenant_id, integration_id, raw_data, job_id
+                        )
+                        logger.info(f"✅ [BATCH] Createmeta batch {batch_num} completed")
+
+                    else:
+                        logger.warning(f"Unknown data type in batch: {data_type}")
+                        continue
+
+                # Step 3: Create custom_fields_mappings using .env keys (after all batches)
+                logger.info(f"📋 [BATCH] Creating custom_fields_mappings using .env keys")
+
+                # Load environment variables from root .env file (fallback to service .env)
+                from dotenv import load_dotenv
+                import os as os_module
+
+                # Load root .env file first (if exists)
+                # Path: services/backend/app/etl/jira/jira_transform_worker.py -> ../../../../../.env
+                root_env_path = os_module.path.join(os_module.path.dirname(__file__), '..', '..', '..', '..', '..', '.env')
+                root_env_path_abs = os_module.path.abspath(root_env_path)
+                logger.info(f"🔍 [BATCH] Looking for root .env at: {root_env_path_abs}")
+                logger.info(f"🔍 [BATCH] Root .env exists: {os_module.path.exists(root_env_path)}")
+
+                if os_module.path.exists(root_env_path):
+                    load_dotenv(root_env_path, override=True)  # Override to ensure we get the values
+                    logger.info(f"📋 [BATCH] Loaded environment from root .env: {root_env_path_abs}")
+                else:
+                    logger.warning(f"⚠️ [BATCH] Root .env not found at: {root_env_path_abs}")
+
+                # Auto-map special fields
+                special_field_mappings = {
+                    'JIRA_TEAM_FIELD_ID': 'team_field_id',
+                    'JIRA_DEVELOPMENT_FIELD_ID': 'development_field_id',
+                    'JIRA_SPRINTS_FIELD_ID': 'sprints_field_id',
+                    'JIRA_STORY_POINTS_FIELD_ID': 'story_points_field_id',
+                    'JIRA_ACCEPTANCE_CRITERIA_FIELD_ID': 'acceptance_criteria_field_id'
+                }
+
+                logger.info(f"🔍 [BATCH] Processing {len(special_field_mappings)} special fields from .env")
+                for env_var, mapping_column in special_field_mappings.items():
+                    field_external_id = os.getenv(env_var)
+                    logger.info(f"🔍 [BATCH] {env_var} = {field_external_id}")
+                    if field_external_id:
+                        self._auto_map_special_field(session, tenant_id, integration_id, field_external_id, mapping_column)
+                    else:
+                        logger.warning(f"⚠️ [BATCH] {env_var} is not set in .env, skipping")
+
+                # Auto-map custom field columns (custom_field_01 through custom_field_20)
+                logger.info(f"🔍 [BATCH] Processing custom field columns (01-20) from .env")
+                for i in range(1, 21):
+                    env_var_name = f"JIRA_CUSTOM_FIELD_{i:02d}_ID"
+                    custom_field_external_id = os.getenv(env_var_name)
+
+                    if custom_field_external_id:
+                        logger.info(f"🔍 [BATCH] {env_var_name} = {custom_field_external_id}")
+                        mapping_column = f"custom_field_{i:02d}_id"
+                        self._auto_map_special_field(session, tenant_id, integration_id, custom_field_external_id, mapping_column)
+                    else:
+                        logger.debug(f"🔍 [BATCH] {env_var_name} is empty, skipping")
+
+                logger.info(f"✅ [BATCH] Custom fields mappings created successfully")
+
+                # Commit all changes
+                session.commit()
+                logger.info(f"✅ [BATCH] All {len(raw_data_ids)} raw_data records processed and committed")
+
+            # 🔑 FIRST-RUN CHECK: If no custom_fields have been embedded yet, embed ALL fields
+            # Otherwise, use change detection logic
+            with self.get_db_session() as session:
+                from app.models.unified_models import QdrantVector
+                from sqlalchemy import text
+
+                # Check if any custom_fields vectors exist
+                query = text("""
+                    SELECT COUNT(*)
+                    FROM qdrant_vectors
+                    WHERE tenant_id = :tenant_id
+                    AND table_name = 'custom_fields'
+                """)
+                result = session.execute(query, {'tenant_id': tenant_id})
+                existing_vectors_count = result.scalar()
+
+                logger.info(f"🔍 [FIRST-RUN CHECK] Found {existing_vectors_count} existing custom_fields vectors")
+
+                if existing_vectors_count == 0 and all_custom_field_ids:
+                    # First run - embed ALL custom fields
+                    logger.info(f"🎯 [FIRST-RUN] No existing vectors found - will embed ALL {len(all_custom_field_ids)} custom fields")
+                    changed_custom_field_ids = all_custom_field_ids.copy()
+
+            # Check if any custom fields need embedding
+            if not changed_custom_field_ids:
+                # No changes detected - early closure (skip embedding)
+                logger.info(f"🎯 [EARLY CLOSURE] No custom fields changed - skipping embedding")
+
+                # Send both transform AND embedding "finished" status
+                if job_id:
+                    await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_custom_fields")
+                    logger.info(f"✅ [BATCH] Transform marked as finished (no changes)")
+
+                    await self._send_worker_status("embedding", tenant_id, job_id, "finished", "config_custom_fields")
+                    logger.info(f"✅ [BATCH] Embedding marked as finished (no changes - early closure)")
+
+                    # 🔑 custom_fields is the LAST step - complete the ETL job when no changes
+                    logger.info(f"🏁 [CONFIG] custom_fields has no changes - completing ETL job {job_id}")
+                    await self.status_manager.complete_etl_job(
+                        job_id=job_id,
+                        tenant_id=tenant_id,
+                        last_sync_date=None,
+                        rate_limited=False
+                    )
+                    logger.info(f"✅ [CONFIG] ETL job {job_id} marked as FINISHED (no custom_fields changes)")
+            else:
+                # Changes detected - queue for embedding
+                logger.info(f"📤 [BATCH] Queuing {len(changed_custom_field_ids)} changed custom fields for embedding (skipping {len(all_custom_field_ids) - len(changed_custom_field_ids)} unchanged)")
+                # 🔑 Custom fields is the LAST step of config job - always set last_job_item=True for embedding
+                await self._queue_custom_fields_for_embedding(
+                    tenant_id, integration_id, changed_custom_field_ids, job_id, token
+                )
+
+                # Send transform "finished" status
+                if job_id:
+                    await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_custom_fields")
+                    logger.info(f"✅ [BATCH] Custom fields batch processing completed (transform finished, waiting for embedding)")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing custom fields batch: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_all_custom_fields_bulk(
+        self, session, tenant_id: int, integration_id: int, raw_data: Dict[str, Any]
+    ) -> tuple[List[str], List[str]]:
+        """
+        Bulk UPSERT all custom fields from raw_data with change detection.
+
+        Args:
+            session: Database session
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            raw_data: Raw data containing all custom fields
+
+        Returns:
+            tuple[List[str], List[str]]: (changed_field_ids, all_field_ids)
+                - changed_field_ids: Only fields that were inserted or actually changed
+                - all_field_ids: All field IDs that were processed
+        """
+        from app.models.unified_models import CustomField
+        from app.etl.workers.bulk_operations import BulkOperations
+
+        custom_fields_data = raw_data.get('data', [])
+        total_count = raw_data.get('total_count', len(custom_fields_data))
+
+        logger.info(f"🔄 [BULK] Processing {total_count} custom fields with change detection")
+
+        # Prepare data for bulk operations
+        fields_to_insert = []
+        fields_to_update = []
+        all_field_ids = []
+        changed_field_ids = []
+
+        # Fetch existing custom fields for this integration
+        existing_fields = session.query(CustomField).filter(
+            CustomField.tenant_id == tenant_id,
+            CustomField.integration_id == integration_id
+        ).all()
+
+        existing_field_map = {f.external_id: f for f in existing_fields}
+
+        for field_data in custom_fields_data:
+            field_id = field_data.get('id')
+            if not field_id:
+                continue
+
+            all_field_ids.append(field_id)
+
+            # Extract field metadata
+            field_name = field_data.get('name', '')
+            schema = field_data.get('schema', {})
+            field_type = schema.get('type', 'unknown')
+            operations = field_data.get('operations', [])
+
+            field_record = {
+                'external_id': field_id,
+                'name': field_name,
+                'field_type': field_type,
+                'operations': operations,
+                'integration_id': integration_id,
+                'tenant_id': tenant_id,
+                'active': True
+            }
+
+            if field_id in existing_field_map:
+                # Check if field actually changed
+                existing_field = existing_field_map[field_id]
+
+                # Compare relevant fields to detect changes
+                # Note: operations is stored as JSON in DB, need to compare as lists
+                existing_operations = existing_field.operations if existing_field.operations else []
+                new_operations = operations if operations else []
+
+                has_changes = (
+                    existing_field.name != field_name or
+                    existing_field.field_type != field_type or
+                    existing_operations != new_operations or
+                    existing_field.active != True
+                )
+
+                if has_changes:
+                    # Update existing field
+                    field_record['id'] = existing_field.id
+                    fields_to_update.append(field_record)
+                    changed_field_ids.append(field_id)
+                    logger.info(f"🔍 [CHANGE DETECTED] Custom field {field_id} ({field_name}) has changes")
+                else:
+                    logger.debug(f"⏭️ [NO CHANGE] Custom field {field_id} ({field_name}) unchanged")
+            else:
+                # Insert new field
+                fields_to_insert.append(field_record)
+                changed_field_ids.append(field_id)
+                logger.debug(f"✨ [NEW] Custom field {field_id} ({field_name}) is new")
+
+        # Perform bulk operations
+        if fields_to_insert:
+            logger.debug(f"📥 [BULK] Inserting {len(fields_to_insert)} new custom fields")
+            BulkOperations.bulk_insert(session, 'custom_fields', fields_to_insert)
+
+        if fields_to_update:
+            logger.info(f"🔄 [BULK] Updating {len(fields_to_update)} existing custom fields")
+            BulkOperations.bulk_update(session, 'custom_fields', fields_to_update)
+
+        logger.info(f"✅ [BULK] Processed {len(all_field_ids)} custom fields ({len(fields_to_insert)} new, {len(fields_to_update)} updated, {len(all_field_ids) - len(changed_field_ids)} unchanged)")
+        logger.info(f"📊 [CHANGE SUMMARY] {len(changed_field_ids)} fields need embedding, {len(all_field_ids) - len(changed_field_ids)} fields skipped")
+
+        return changed_field_ids, all_field_ids
+
+    async def _process_createmeta_batch(
+        self, session, tenant_id: int, integration_id: int, raw_data: Dict[str, Any], job_id: int = None
+    ) -> bool:
+        """
+        Process a batch of createmeta data (multiple projects).
+
+        This creates:
+        1. Projects (if not exist)
+        2. custom_fields_projects relationships
+        3. custom_fields_mappings using .env keys
+
+        Args:
+            session: Database session
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            raw_data: Raw data containing createmeta batch
+            job_id: Job ID (optional)
+
+        Returns:
+            bool: True if successful
+        """
+        from app.models.unified_models import CustomField, CustomFieldProject, CustomFieldMapping, Project
+        from app.etl.workers.bulk_operations import BulkOperations
+
+        createmeta_data = raw_data.get('data', {})
+        projects = createmeta_data.get('projects', [])
+
+        logger.info(f"🔄 [CREATEMETA] Processing {len(projects)} projects")
+
+        # Step 1: Create/update projects from createmeta
+        projects_to_insert = []
+        projects_to_update = []
+
+        existing_projects = session.query(Project).filter(
+            Project.tenant_id == tenant_id,
+            Project.integration_id == integration_id
+        ).all()
+        existing_project_map = {p.external_id: p for p in existing_projects}
+
+        for project_data in projects:
+            project_id = project_data.get('id')
+            project_key = project_data.get('key')
+            project_name = project_data.get('name')
+
+            if not project_id or not project_key:
+                continue
+
+            project_record = {
+                'external_id': project_id,
+                'key': project_key,
+                'name': project_name,
+                'integration_id': integration_id,
+                'tenant_id': tenant_id,
+                'active': True
+            }
+
+            if project_id in existing_project_map:
+                project_record['id'] = existing_project_map[project_id].id
+                projects_to_update.append(project_record)
+            else:
+                projects_to_insert.append(project_record)
+
+        if projects_to_insert:
+            logger.info(f"📥 [CREATEMETA] Inserting {len(projects_to_insert)} new projects")
+            BulkOperations.bulk_insert(session, 'projects', projects_to_insert)
+
+        if projects_to_update:
+            logger.info(f"🔄 [CREATEMETA] Updating {len(projects_to_update)} existing projects")
+            BulkOperations.bulk_update(session, 'projects', projects_to_update)
+
+        # Step 2: Create custom_fields_projects relationships
+        custom_field_project_relationships = []
+
+        for project_data in projects:
+            proj_key = project_data.get('key')
+            if not proj_key:
+                continue
+
+            # Get issue types for this project
+            issue_types = project_data.get('issueTypes', project_data.get('issuetypes', []))
+
+            # Collect all custom fields across all issue types for this project
+            project_custom_fields = set()
+            for issue_type in issue_types:
+                fields = issue_type.get('fields', {})
+                for field_key, field_info in fields.items():
+                    # Only process custom fields (start with 'customfield_')
+                    if field_key.startswith('customfield_'):
+                        project_custom_fields.add(field_key)
+
+            # Create relationship entries
+            for field_id in project_custom_fields:
+                custom_field_project_relationships.append({
+                    'custom_field_external_id': field_id,
+                    'project_key': proj_key
+                })
+
+        logger.info(f"📊 [CREATEMETA] Extracted {len(custom_field_project_relationships)} custom field-project relationships")
+
+        # Create custom field-project relationships
+        if custom_field_project_relationships:
+            cf_relationships_created = self._create_custom_field_project_relationships(
+                session, custom_field_project_relationships, tenant_id, integration_id
+            )
+            logger.info(f"✅ [CREATEMETA] Created {cf_relationships_created} custom field-project relationships")
+
+        logger.info(f"✅ [CREATEMETA] Batch processing completed for {len(projects)} projects")
+        return True
+
+    async def _queue_custom_fields_for_embedding(
+        self, tenant_id: int, integration_id: int, custom_field_ids: List[str],
+        job_id: int, token: str
+    ):
+        """
+        Queue custom fields for embedding in batches of 100.
+
+        This method determines first_item, last_item, and last_job_item flags internally
+        based on batch position. Custom fields is the LAST step of config job, so the
+        last batch always gets last_job_item=True.
+
+        Args:
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            custom_field_ids: List of custom field external_ids
+            job_id: Job ID
+            token: Job execution token
+        """
+        BATCH_SIZE = 100
+        total_fields = len(custom_field_ids)
+        total_batches = (total_fields + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
+
+        logger.info(f"📤 Queuing {total_fields} custom fields for embedding in {total_batches} batches of {BATCH_SIZE}")
+
+        # Queue custom fields in batches of 100
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, total_fields)
+            batch_field_ids = custom_field_ids[start_idx:end_idx]
+
+            is_first_batch = (batch_idx == 0)
+            is_last_batch = (batch_idx == total_batches - 1)
+
+            logger.debug(f"📦 Queuing batch {batch_idx + 1}/{total_batches}: {len(batch_field_ids)} fields (first={is_first_batch}, last={is_last_batch})")
+
+            self._queue_entities_for_embedding(
+                tenant_id=tenant_id,
+                integration_id=integration_id,
+                table_name='custom_fields',
+                entities=[{'external_id': fid} for fid in batch_field_ids],  # Batch of 100 external_ids
+                job_id=job_id,
+                first_item=is_first_batch,  # 🔑 Only first batch gets first_item=True
+                last_item=is_last_batch,    # 🔑 Only last batch gets last_item=True
+                last_job_item=is_last_batch,  # 🔑 Only LAST batch gets last_job_item=True (custom fields is the last step)
+                provider='jira',
+                message_type='config_custom_fields',
+                token=token
+            )
+
+        logger.info(f"✅ Queued {total_fields} custom fields in {total_batches} batches for embedding")
+
+    def _process_jira_special_fields(
+        self, raw_data_id: int, tenant_id: int, integration_id: int
+    ) -> bool:
+        """
+        Process special fields from /rest/api/3/field/search API response.
+
+        Special fields are those not available in createmeta API (e.g., development field).
+        This method can handle any field fetched via field search API.
+
+        Response format:
+        {
+            "maxResults": 50,
+            "startAt": 0,
+            "total": 1,
+            "isLast": true,
+            "values": [
+                {
+                    "id": "customfield_10000",
+                    "name": "development",
+                    "schema": {"type": "any", "custom": "...", "customId": 10000},
+                    "typeDisplayName": "Dev Summary Custom Field",
+                    "description": "Includes development summary panel information used in JQL"
+                }
+            ]
+        }
+
+        Args:
+            raw_data_id: ID of raw_extraction_data record
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+
+        Returns:
+            bool: True if processing succeeded
+        """
+        try:
+            from app.core.utils import DateTimeHelper
+            now = DateTimeHelper.now_default()
+
+            with self.get_db_session() as session:
+                # 1. Get raw data
+                raw_data = self._get_raw_data(session, raw_data_id)
+                if not raw_data:
+                    logger.error(f"Raw data not found: {raw_data_id}")
+                    return False
+
+                # 2. Parse field search response
+                field_search_response = raw_data
+                values = field_search_response.get('values', [])
+
+                if not values:
+                    logger.warning(f"No field data found in raw data: {raw_data_id}")
+                    return True  # Not an error, just empty data
+
+                # Get the first (and should be only) field
+                field_data = values[0]
+                field_id = field_data.get('id')
+                field_name = field_data.get('name', 'Unknown')
+                field_schema = field_data.get('schema', {})
+                field_type = field_schema.get('type', 'any')
+
+                # Rename 'development' to 'Development' for better display
+                if field_name.lower() == 'development':
+                    field_name = 'Development'
+
+                logger.debug(f"Processing special field: {field_id} - {field_name}")
+
+                # 3. Use UPSERT to insert or update custom field (avoid race conditions)
+                logger.debug(f"Upserting special field: {field_id} - {field_name}")
+                upsert_query = text("""
+                    INSERT INTO custom_fields (
+                        external_id, name, field_type, operations,
+                        tenant_id, integration_id, active, created_at, last_updated_at
+                    ) VALUES (
+                        :external_id, :name, :field_type, :operations,
+                        :tenant_id, :integration_id, TRUE, :created_at, :last_updated_at
+                    )
+                    ON CONFLICT (tenant_id, integration_id, external_id)
+                    DO UPDATE SET
+                        name = EXCLUDED.name,
+                        field_type = EXCLUDED.field_type,
+                        last_updated_at = EXCLUDED.last_updated_at
+                """)
+                session.execute(upsert_query, {
+                    'external_id': field_id,
+                    'name': field_name,
+                    'field_type': field_type,
+                    'operations': None,  # No operations for special fields
+                    'tenant_id': tenant_id,
+                    'integration_id': integration_id,
+                    'created_at': now,
+                    'last_updated_at': now
+                })
+
+                # 5. Auto-map special fields if this is a special field
+                import os
+                team_field_id = os.getenv('JIRA_TEAM_FIELD_ID', 'customfield_10001')
+                development_field_id = os.getenv('JIRA_DEVELOPMENT_FIELD_ID', 'customfield_10000')
+                sprints_field_id = os.getenv('JIRA_SPRINTS_FIELD_ID', 'customfield_10021')
+                story_points_field_id = os.getenv('JIRA_STORY_POINTS_FIELD_ID', 'customfield_10024')
+                acceptance_criteria_field_id = os.getenv('JIRA_ACCEPTANCE_CRITERIA_FIELD_ID', 'customfield_10222')
+
+                if field_id == team_field_id:
+                    self._auto_map_special_field(session, tenant_id, integration_id, field_id, 'team_field_id')
+                elif field_id == development_field_id:
+                    self._auto_map_special_field(session, tenant_id, integration_id, field_id, 'development_field_id')
+                elif field_id == sprints_field_id:
+                    self._auto_map_special_field(session, tenant_id, integration_id, field_id, 'sprints_field_id')
+                elif field_id == story_points_field_id:
+                    self._auto_map_special_field(session, tenant_id, integration_id, field_id, 'story_points_field_id')
+                elif field_id == acceptance_criteria_field_id:
+                    self._auto_map_special_field(session, tenant_id, integration_id, field_id, 'acceptance_criteria_field_id')
+                else:
+                    # Check if this field matches any custom field column environment variables
+                    for i in range(1, 21):
+                        env_var_name = f"JIRA_CUSTOM_FIELD_{i:02d}_ID"
+                        custom_field_external_id = os.getenv(env_var_name)
+
+                        if custom_field_external_id and field_id == custom_field_external_id:
+                            mapping_column = f"custom_field_{i:02d}_id"
+                            self._auto_map_special_field(session, tenant_id, integration_id, field_id, mapping_column)
+                            break
+
+                # 6. Update raw data status
+                self._update_raw_data_status(session, raw_data_id, 'completed')
+
+                # Commit all changes
+                session.commit()
+
+                logger.debug(f"Successfully processed special field for raw_data_id={raw_data_id}")
+                return True
+
+        except Exception as e:
+            logger.error(f"Error processing Jira special field: {e}")
+            return False
+
+    def _get_raw_data(self, session, raw_data_id: int) -> Optional[Dict[str, Any]]:
+        """Get raw data from database."""
+        try:
+            query = text("""
+                SELECT raw_data FROM raw_extraction_data 
+                WHERE id = :raw_data_id AND status = 'pending'
+            """)
+            result = session.execute(query, {'raw_data_id': raw_data_id}).fetchone()
+            return result[0] if result else None
+        except Exception as e:
+            logger.error(f"Error getting raw data: {e}")
+            return None
+    
+    def _update_raw_data_status(self, session, raw_data_id: int, status: str):
+        """Update raw data processing status."""
+        try:
+            from app.core.utils import DateTimeHelper
+            now = DateTimeHelper.now_default()
+
+            query = text("""
+                UPDATE raw_extraction_data
+                SET status = :status, last_updated_at = :now
+                WHERE id = :raw_data_id
+            """)
+            session.execute(query, {'raw_data_id': raw_data_id, 'status': status, 'now': now})
+        except Exception as e:
+            logger.error(f"Error updating raw data status: {e}")
+            raise
+
+    def _auto_map_special_field(self, session, tenant_id: int, integration_id: int,
+                                 field_external_id: str, mapping_column: str):
+        """
+        Auto-map special field to custom_fields_mappings table.
+        This is called after a special field is saved to custom_fields table.
+
+        Args:
+            session: Database session
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            field_external_id: External ID of the field (e.g., 'customfield_10000')
+            mapping_column: Column name in custom_fields_mappings (e.g., 'development_field_id', 'sprints_field_id')
+        """
+        try:
+            from app.core.utils import DateTimeHelper
+
+            now = DateTimeHelper.now_default()
+
+            logger.info(f"🔍 [AUTO-MAP] Attempting to auto-map {field_external_id} to {mapping_column}")
+
+            # Check if special field exists in custom_fields
+            check_query = text("""
+                SELECT id FROM custom_fields
+                WHERE external_id = :external_id
+                AND tenant_id = :tenant_id
+                AND integration_id = :integration_id
+                AND active = true
+            """)
+            result = session.execute(check_query, {
+                'external_id': field_external_id,
+                'tenant_id': tenant_id,
+                'integration_id': integration_id
+            }).fetchone()
+
+            if not result:
+                logger.warning(f"⚠️ [AUTO-MAP] Field {field_external_id} not found in custom_fields table, skipping auto-mapping for {mapping_column}")
+                return
+
+            custom_field_db_id = result[0]
+            logger.info(f"✅ [AUTO-MAP] Found field {field_external_id} with DB ID {custom_field_db_id}")
+
+            # Check if custom_fields_mappings record exists
+            mapping_check_query = text("""
+                SELECT id FROM custom_fields_mappings
+                WHERE tenant_id = :tenant_id
+                AND integration_id = :integration_id
+            """)
+            mapping_result = session.execute(mapping_check_query, {
+                'tenant_id': tenant_id,
+                'integration_id': integration_id
+            }).fetchone()
+
+            if mapping_result:
+                # Update existing mapping
+                update_query = text(f"""
+                    UPDATE custom_fields_mappings
+                    SET {mapping_column} = :field_id,
+                        last_updated_at = :now
+                    WHERE tenant_id = :tenant_id
+                    AND integration_id = :integration_id
+                """)
+                session.execute(update_query, {
+                    'field_id': custom_field_db_id,
+                    'tenant_id': tenant_id,
+                    'integration_id': integration_id,
+                    'now': now
+                })
+                logger.info(f"✅ [AUTO-MAP] Updated existing mapping: {mapping_column} = {custom_field_db_id} ({field_external_id})")
+            else:
+                # Create new mapping record
+                insert_query = text(f"""
+                    INSERT INTO custom_fields_mappings (
+                        tenant_id, integration_id, {mapping_column},
+                        active, created_at, last_updated_at
+                    ) VALUES (
+                        :tenant_id, :integration_id, :field_id,
+                        true, :created_at, :last_updated_at
+                    )
+                """)
+                session.execute(insert_query, {
+                    'tenant_id': tenant_id,
+                    'integration_id': integration_id,
+                    'field_id': custom_field_db_id,
+                    'created_at': now,
+                    'last_updated_at': now
+                })
+                logger.info(f"✅ [AUTO-MAP] Created new mapping record: {mapping_column} = {custom_field_db_id} ({field_external_id})")
+
+        except Exception as e:
+            logger.error(f"❌ [AUTO-MAP] Error auto-mapping field {field_external_id} to {mapping_column}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            # Don't raise - this is a nice-to-have feature, not critical
+
+    def _get_existing_projects(self, session, tenant_id: int, integration_id: int) -> Dict[str, Project]:
+        """Get existing projects indexed by external_id."""
+        projects = session.query(Project).filter(
+            Project.tenant_id == tenant_id,
+            Project.integration_id == integration_id,
+            Project.active == True
+        ).all()
+        return {p.external_id: p for p in projects if p.external_id}
+
+    def _get_existing_wits(self, session, tenant_id: int, integration_id: int) -> Dict[str, Wit]:
+        """Get existing WITs indexed by external_id."""
+        wits = session.query(Wit).filter(
+            Wit.tenant_id == tenant_id,
+            Wit.integration_id == integration_id,
+            Wit.active == True
+        ).all()
+        return {w.external_id: w for w in wits if w.external_id}
+
+    def _get_existing_custom_fields(self, session, tenant_id: int, integration_id: int) -> Dict[str, CustomField]:
+        """Get existing custom fields indexed by external_id."""
+        custom_fields = session.query(CustomField).filter(
+            CustomField.tenant_id == tenant_id,
+            CustomField.integration_id == integration_id,
+            CustomField.active == True
+        ).all()
+        return {cf.external_id: cf for cf in custom_fields if cf.external_id}
+
+    def _get_existing_project_wit_relationships(self, session, tenant_id: int) -> set:
+        """Get existing project-wit relationships as set of tuples."""
+        query = text("""
+            SELECT pw.project_id, pw.wit_id
+            FROM projects_wits pw
+            JOIN projects p ON pw.project_id = p.id
+            WHERE p.tenant_id = :tenant_id AND p.active = true
+        """)
+        result = session.execute(query, {'tenant_id': tenant_id}).fetchall()
+        return {(row[0], row[1]) for row in result}
+
+    def _create_project_wit_relationships_for_search(self, session, project_wit_relationships: List[tuple], integration_id: int, tenant_id: int) -> int:
+        """
+        Create project-wit relationships from external IDs.
+
+        Args:
+            session: Database session
+            project_wit_relationships: List of (project_external_id, wit_external_id) tuples
+            integration_id: Integration ID
+            tenant_id: Tenant ID
+
+        Returns:
+            Number of relationships created
+        """
+        try:
+            logger.info(f"🔍 DEBUG: _create_project_wit_relationships_for_search called with {len(project_wit_relationships)} relationships")
+
+            if not project_wit_relationships:
+                logger.debug("No project-wit relationships to create")
+                return 0
+
+            # Get mapping of external_id -> internal_id for projects
+            logger.debug("🔍 DEBUG: Querying projects mapping...")
+            projects_query = text("""
+                SELECT external_id, id
+                FROM projects
+                WHERE integration_id = :integration_id AND tenant_id = :tenant_id AND active = true
+            """)
+            projects_result = session.execute(projects_query, {
+                'integration_id': integration_id,
+                'tenant_id': tenant_id
+            }).fetchall()
+            projects_lookup = {row[0]: row[1] for row in projects_result}
+            logger.debug(f"🔍 DEBUG: Found {len(projects_lookup)} projects")
+
+            # Get mapping of external_id -> internal_id for WITs
+            logger.debug("🔍 DEBUG: Querying WITs mapping...")
+            wits_query = text("""
+                SELECT external_id, id
+                FROM wits
+                WHERE integration_id = :integration_id AND tenant_id = :tenant_id AND active = true
+            """)
+            wits_result = session.execute(wits_query, {
+                'integration_id': integration_id,
+                'tenant_id': tenant_id
+            }).fetchall()
+            wits_lookup = {row[0]: row[1] for row in wits_result}
+            logger.debug(f"🔍 DEBUG: Found {len(wits_lookup)} WITs")
+
+            # Get existing relationships
+            logger.debug("🔍 DEBUG: Getting existing relationships...")
+            existing_relationships = self._get_existing_project_wit_relationships(session, tenant_id)
+            logger.debug(f"🔍 DEBUG: Found {len(existing_relationships)} existing relationships")
+
+            # Build relationships to insert
+            logger.debug("🔍 DEBUG: Building relationships to insert...")
+            relationships_to_insert = []
+            for project_external_id, wit_external_id in project_wit_relationships:
+                # Convert to strings for database lookup (external_id is VARCHAR in DB)
+                project_external_id_str = str(project_external_id)
+                wit_external_id_str = str(wit_external_id)
+
+                logger.debug(f"🔍 DEBUG: Looking up project {project_external_id_str} and wit {wit_external_id_str}")
+
+                project_id = projects_lookup.get(project_external_id_str)
+                wit_id = wits_lookup.get(wit_external_id_str)
+
+                if not project_id:
+                    logger.warning(f"Project with external_id {project_external_id_str} not found in lookup")
+                    continue
+
+                if not wit_id:
+                    logger.warning(f"WIT with external_id {wit_external_id_str} not found in lookup")
+                    continue
+
+                # Check if relationship already exists
+                if (project_id, wit_id) not in existing_relationships:
+                    relationships_to_insert.append((project_id, wit_id))
+                    logger.debug(f"🔍 DEBUG: Added relationship to insert: project_id={project_id}, wit_id={wit_id}")
+
+            logger.debug(f"🔍 DEBUG: Built {len(relationships_to_insert)} relationships to insert")
+
+            if not relationships_to_insert:
+                logger.debug("No new project-wit relationships to create")
+                return 0
+
+            # Bulk insert relationships
+            logger.debug(f"🔍 DEBUG: Starting bulk insert of {len(relationships_to_insert)} relationships...")
+            BulkOperations.bulk_insert_relationships(session, 'projects_wits', relationships_to_insert)
+            logger.debug(f"🔍 DEBUG: Bulk insert completed")
+
+            logger.info(f"Created {len(relationships_to_insert)} project-wit relationships")
+            return len(relationships_to_insert)
+
+        except Exception as e:
+            logger.error(f"Error creating project-wit relationships: {e}", exc_info=True)
+            raise
+
+    def _create_custom_field_project_relationships(
+        self,
+        session,
+        custom_field_project_relationships: List[Dict[str, Any]],
+        tenant_id: int,
+        integration_id: int
+    ) -> int:
+        """
+        Create custom field-project relationships in custom_fields_projects junction table.
+        Simple many-to-many relationship using custom_field_id and project_id.
+
+        Args:
+            session: Database session
+            custom_field_project_relationships: List of dicts with:
+                - custom_field_external_id: Field ID (e.g., 'customfield_10128')
+                - project_key: Project key (e.g., 'PROJ1')
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+
+        Returns:
+            Number of relationships created
+        """
+        try:
+            if not custom_field_project_relationships:
+                logger.debug("No custom field-project relationships to create")
+                return 0
+
+            logger.info(f"Creating {len(custom_field_project_relationships)} custom field-project relationships")
+
+            # Get custom fields lookup (external_id -> internal id)
+            custom_fields_query = text("""
+                SELECT id, external_id
+                FROM custom_fields
+                WHERE tenant_id = :tenant_id AND integration_id = :integration_id AND active = true
+            """)
+            custom_fields_result = session.execute(custom_fields_query, {
+                'tenant_id': tenant_id,
+                'integration_id': integration_id
+            }).fetchall()
+            custom_fields_lookup = {row[1]: row[0] for row in custom_fields_result}
+
+            logger.debug(f"Found {len(custom_fields_lookup)} custom fields in lookup")
+
+            # Get projects lookup (key -> internal id)
+            projects_query = text("""
+                SELECT id, key
+                FROM projects
+                WHERE tenant_id = :tenant_id AND integration_id = :integration_id AND active = true
+            """)
+            projects_result = session.execute(projects_query, {
+                'tenant_id': tenant_id,
+                'integration_id': integration_id
+            }).fetchall()
+            projects_lookup = {row[1]: row[0] for row in projects_result}
+
+            logger.debug(f"Found {len(projects_lookup)} projects in lookup")
+
+            # Get existing relationships to avoid duplicates
+            existing_query = text("""
+                SELECT custom_field_id, project_id
+                FROM custom_fields_projects
+            """)
+            existing_result = session.execute(existing_query).fetchall()
+            existing_pairs = {(row[0], row[1]) for row in existing_result}
+
+            logger.debug(f"Found {len(existing_pairs)} existing custom field-project relationships")
+
+            # Build relationships to insert
+            relationships_to_insert = []
+
+            for rel in custom_field_project_relationships:
+                field_external_id = rel['custom_field_external_id']
+                project_key = rel['project_key']
+
+                # Look up custom field internal ID
+                custom_field_id = custom_fields_lookup.get(field_external_id)
+                if not custom_field_id:
+                    logger.warning(f"Custom field {field_external_id} not found in custom_fields table")
+                    continue
+
+                # Look up project internal ID
+                project_id = projects_lookup.get(project_key)
+                if not project_id:
+                    logger.warning(f"Project {project_key} not found in projects table")
+                    continue
+
+                # Check if relationship already exists
+                if (custom_field_id, project_id) not in existing_pairs:
+                    relationships_to_insert.append({
+                        'custom_field_id': custom_field_id,
+                        'project_id': project_id
+                    })
+
+            logger.debug(f"Built {len(relationships_to_insert)} relationships to insert")
+
+            # Bulk insert new relationships
+            if relationships_to_insert:
+                insert_query = text("""
+                    INSERT INTO custom_fields_projects (custom_field_id, project_id)
+                    VALUES (:custom_field_id, :project_id)
+                    ON CONFLICT (custom_field_id, project_id) DO NOTHING
+                """)
+
+                for rel in relationships_to_insert:
+                    session.execute(insert_query, rel)
+
+                logger.info(f"Inserted {len(relationships_to_insert)} custom field-project relationships")
+
+            return len(relationships_to_insert)
+
+        except Exception as e:
+            logger.error(f"Error creating custom field-project relationships: {e}", exc_info=True)
+            raise
+
+    def _process_project_data(
+        self,
+        project_data: Dict[str, Any],
+        tenant_id: int,
+        integration_id: int,
+        existing_projects: Dict[str, Project],
+        existing_wits: Dict[str, Wit],
+        existing_custom_fields: Dict[str, CustomField],
+        existing_relationships: set,
+        global_custom_fields: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, List]:
+        """
+        Process a single project's data from createmeta response.
+
+        Returns:
+            Dict with lists of data to insert/update and project-wit relationships to create
+        """
+        result = {
+            'projects_to_insert': [],
+            'projects_to_update': [],
+            'wits_to_insert': [],
+            'wits_to_update': [],
+            'project_wit_relationships': [],
+            'custom_field_project_relationships': []  # NEW: Track which custom fields appear in which projects
+        }
+
+        try:
+            project_external_id = project_data.get('id')
+            project_key = project_data.get('key')
+            project_name = project_data.get('name')
+            # Handle both camelCase (project search API) and lowercase (createmeta API)
+            issue_types = project_data.get('issueTypes', project_data.get('issuetypes', []))
+
+            logger.debug(f"🔍 DEBUG: _process_project_data - Processing {project_key} ({project_name}) with {len(issue_types)} issue types")
+
+            if not all([project_external_id, project_key, project_name]):
+                logger.warning(f"Incomplete project data: {project_data}")
+                return result
+
+            # Process project
+            if project_external_id in existing_projects:
+                # Check if project needs update
+                existing_project = existing_projects[project_external_id]
+
+                # Check if this is from custom fields extraction (has custom_fields dict)
+                # vs regular job extraction (no custom_fields dict)
+                is_custom_fields_extraction = bool(existing_custom_fields)
+
+                if is_custom_fields_extraction:
+                    # Custom fields extraction: minimal update (only key if changed)
+                    # This ensures regular job will detect name/type changes and trigger embedding
+                    if existing_project.key != project_key:
+                        result['projects_to_update'].append({
+                            'id': existing_project.id,
+                            'external_id': project_external_id,  # Include for consistency
+                            'key': project_key,
+                            'last_updated_at': DateTimeHelper.now_default()
+                        })
+                else:
+                    # Regular job extraction: full update check
+                    # Check if project was created by custom fields extraction (has incomplete data)
+                    # OR if key/name changed
+                    project_type_from_api = project_data.get('projectTypeKey')
+                    needs_update = False
+                    update_data = {
+                        'id': existing_project.id,
+                        'external_id': project_external_id,  # Include for embedding queue
+                        'last_updated_at': DateTimeHelper.now_default()
+                    }
+
+                    # Check if project has incomplete data (created by custom fields extraction)
+                    if existing_project.project_type is None and project_type_from_api:
+                        needs_update = True
+                        update_data['project_type'] = project_type_from_api
+                        logger.debug(f"Project {project_key} needs update: missing project_type")
+
+                    # Check if key changed
+                    if existing_project.key != project_key:
+                        needs_update = True
+                        update_data['key'] = project_key
+                        logger.debug(f"Project {project_key} needs update: key changed")
+
+                    # Check if name changed
+                    if existing_project.name != project_name:
+                        needs_update = True
+                        update_data['name'] = project_name
+                        logger.debug(f"Project {project_key} needs update: name changed")
+
+                    if needs_update:
+                        result['projects_to_update'].append(update_data)
+                        logger.debug(f"✅ Project {project_key} will be updated and queued for embedding")
+
+                project_id = existing_project.id
+            else:
+                # New project
+                # Check if this is from custom fields extraction vs regular job
+                is_custom_fields_extraction = bool(existing_custom_fields)
+
+                if is_custom_fields_extraction:
+                    # Custom fields extraction: minimal insert (id, external_id, key only)
+                    # This ensures regular job will detect missing name/type and trigger update+embedding
+                    project_insert_data = {
+                        'external_id': project_external_id,
+                        'key': project_key,
+                        'name': project_name or 'Pending',  # Placeholder to satisfy NOT NULL constraint
+                        'project_type': None,
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id,
+                        'active': True,
+                        'created_at': DateTimeHelper.now_default(),
+                        'last_updated_at': DateTimeHelper.now_default()
+                    }
+                else:
+                    # Regular job extraction: full insert with all available fields
+                    project_insert_data = {
+                        'external_id': project_external_id,
+                        'key': project_key,
+                        'name': project_name,
+                        'project_type': project_data.get('projectTypeKey'),  # Available in project search API
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id,
+                        'active': True,
+                        'created_at': DateTimeHelper.now_default(),
+                        'last_updated_at': DateTimeHelper.now_default()
+                    }
+                result['projects_to_insert'].append(project_insert_data)
+                project_id = None  # Will be set after insert
+
+            # Process issue types (WITs) and collect unique custom fields per project
+            # Handle both camelCase (project search API) and lowercase (createmeta API)
+            issue_types = project_data.get('issueTypes', project_data.get('issuetypes', []))
+            unique_custom_fields = {}  # field_key -> field_info (deduplicated)
+            project_wit_external_ids = []  # Store WIT external IDs for this project
+            custom_field_issue_types = {}  # field_key -> list of issue type names (for junction table)
+
+            logger.debug(f"🔍 DEBUG: Processing {len(issue_types)} issue types for project {project_key}")
+
+            for i, issue_type in enumerate(issue_types):
+                wit_external_id = issue_type.get('id')
+                wit_name = issue_type.get('name', 'UNKNOWN')
+
+                logger.debug(f"🔍 DEBUG: Processing issue type {i+1}/{len(issue_types)}: {wit_name} (id: {wit_external_id})")
+
+                if wit_external_id:
+                    project_wit_external_ids.append(wit_external_id)
+                    logger.debug(f"🔍 DEBUG: Added WIT external ID {wit_external_id} to project {project_key}")
+
+                wit_result = self._process_wit_data(
+                    issue_type, tenant_id, integration_id, existing_wits
+                )
+                if wit_result:
+                    wits_to_insert = wit_result.get('wits_to_insert', [])
+                    wits_to_update = wit_result.get('wits_to_update', [])
+
+                    logger.debug(f"🔍 DEBUG: WIT result for {wit_name}: {len(wits_to_insert)} to insert, {len(wits_to_update)} to update")
+
+                    result['wits_to_insert'].extend(wits_to_insert)
+                    result['wits_to_update'].extend(wits_to_update)
+                else:
+                    logger.warning(f"🔍 DEBUG: No WIT result for {wit_name} (id: {wit_external_id})")
+
+                # Collect custom fields from this issue type (deduplicate by field_key)
+                fields = issue_type.get('fields', {})
+                for field_key, field_info in fields.items():
+                    if field_key.startswith('customfield_'):
+                        # Keep the first occurrence of each custom field
+                        if field_key not in unique_custom_fields:
+                            unique_custom_fields[field_key] = field_info
+
+                        # Track which issue types this field appears in (for junction table)
+                        if field_key not in custom_field_issue_types:
+                            custom_field_issue_types[field_key] = []
+                        if wit_name not in custom_field_issue_types[field_key]:
+                            custom_field_issue_types[field_key].append(wit_name)
+
+            # Store project-wit relationships for later processing (after WITs are saved)
+            # We'll store as (project_external_id, wit_external_id) tuples
+            logger.debug(f"🔍 DEBUG: Creating {len(project_wit_external_ids)} project-wit relationships for project {project_key}")
+            logger.debug(f"🔍 DEBUG: WIT external IDs for {project_key}: {project_wit_external_ids}")
+
+            for wit_external_id in project_wit_external_ids:
+                relationship = (project_external_id, wit_external_id)
+                result['project_wit_relationships'].append(relationship)
+                logger.debug(f"🔍 DEBUG: Added relationship: project {project_external_id} -> wit {wit_external_id}")
+
+            # Add unique custom fields from this project to global collection
+            for field_key, field_info in unique_custom_fields.items():
+                # Keep the first occurrence globally (across all projects)
+                if field_key not in global_custom_fields:
+                    global_custom_fields[field_key] = field_info
+
+            # Create custom field-project relationships (for junction table)
+            # Only if we have existing_custom_fields (meaning this is custom fields extraction, not regular job)
+            if existing_custom_fields:
+                for field_key, issue_type_names in custom_field_issue_types.items():
+                    result['custom_field_project_relationships'].append({
+                        'custom_field_external_id': field_key,
+                        'project_key': project_key,
+                        'project_name': project_name,
+                        'issue_types': issue_type_names,
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id
+                    })
+
+            logger.debug(f"🔍 DEBUG: Project {project_key} summary:")
+            logger.debug(f"🔍 DEBUG:   - WITs to insert: {len(result['wits_to_insert'])}")
+            logger.debug(f"🔍 DEBUG:   - WITs to update: {len(result['wits_to_update'])}")
+            logger.debug(f"🔍 DEBUG:   - Project-wit relationships: {len(result['project_wit_relationships'])}")
+            logger.debug(f"🔍 DEBUG:   - Unique custom fields: {len(unique_custom_fields)}")
+            logger.debug(f"🔍 DEBUG:   - Custom field-project relationships: {len(result['custom_field_project_relationships'])}")
+            logger.debug(f"🔍 DEBUG:   - Relationship details: {result['project_wit_relationships']}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error processing project data: {e}")
+            return result
+
+    def _process_wit_data(
+        self,
+        issue_type_data: Dict[str, Any],
+        tenant_id: int,
+        integration_id: int,
+        existing_wits: Dict[str, Wit]
+    ) -> Dict[str, List]:
+        """
+        Process work item type (issue type) data with two-level FK-based mapping architecture.
+
+        Two-Level Mapping:
+        - LEVEL 1: Check wits_mappings by name -> get wit_to and wits_hierarchy_id (FK)
+        - LEVEL 2: If no mapping, lookup wits_hierarchies by original_hierarchy_level -> get wits_hierarchy_id (FK)
+        - FALLBACK: If no match at either level, wits_hierarchy_id = NULL
+        - Always preserve original values in original_name and original_hierarchy_level
+        """
+        result = {
+            'wits_to_insert': [],
+            'wits_to_update': []
+        }
+
+        try:
+            wit_external_id = issue_type_data.get('id')
+            original_name = issue_type_data.get('name')
+            wit_description = issue_type_data.get('description', '')
+            original_hierarchy_level = issue_type_data.get('hierarchyLevel', 0)
+
+            logger.debug(f"🔍 DEBUG: _process_wit_data - Processing WIT: {original_name} (id: {wit_external_id})")
+
+            if not all([wit_external_id, original_name]):
+                logger.warning(f"🔍 DEBUG: Incomplete WIT data: external_id={wit_external_id}, name={original_name}")
+                return result
+
+            # TWO-LEVEL MAPPING LOGIC
+            # LEVEL 1: Check wits_mappings by name
+            mapping = self._lookup_wit_mapping(original_name, integration_id, tenant_id)
+            if mapping:
+                # Use standardized values from mapping
+                standardized_name = mapping['wit_to']
+                wits_hierarchy_id = mapping['wits_hierarchy_id']  # FK from mapping
+                logger.debug(f"[LEVEL 1] Applied mapping for '{original_name}' -> '{standardized_name}' (hierarchy_id: {wits_hierarchy_id})")
+            else:
+                # LEVEL 2: No mapping - use original name and lookup hierarchy by level
+                standardized_name = original_name
+                wits_hierarchy_id = self._lookup_hierarchy_by_level(original_hierarchy_level, tenant_id)
+                if wits_hierarchy_id:
+                    logger.debug(f"[LEVEL 2] No mapping for '{original_name}', found hierarchy by level {original_hierarchy_level} -> hierarchy_id: {wits_hierarchy_id}")
+                else:
+                    logger.debug(f"[FALLBACK] No mapping and no hierarchy found for '{original_name}' (level: {original_hierarchy_level}) -> hierarchy_id: NULL")
+
+            if wit_external_id in existing_wits:
+                # Check if WIT needs update
+                existing_wit = existing_wits[wit_external_id]
+                logger.debug(f"🔍 DEBUG: WIT {original_name} already exists, checking for updates...")
+
+                if (existing_wit.name != standardized_name or
+                    existing_wit.original_name != original_name or
+                    existing_wit.description != wit_description or
+                    existing_wit.wits_hierarchy_id != wits_hierarchy_id or
+                    existing_wit.original_hierarchy_level != original_hierarchy_level):
+                    logger.debug(f"🔍 DEBUG: WIT {original_name} needs update")
+                    result['wits_to_update'].append({
+                        'id': existing_wit.id,
+                        'external_id': wit_external_id,  # Include for queueing
+                        'name': standardized_name,
+                        'original_name': original_name,
+                        'description': wit_description,
+                        'wits_hierarchy_id': wits_hierarchy_id,
+                        'original_hierarchy_level': original_hierarchy_level,
+                        'last_updated_at': DateTimeHelper.now_default()
+                    })
+                else:
+                    logger.debug(f"🔍 DEBUG: WIT {original_name} is up to date, no update needed")
+            else:
+                # New WIT
+                logger.debug(f"🔍 DEBUG: WIT {original_name} is new, adding to insert list")
+                wit_insert_data = {
+                    'external_id': wit_external_id,
+                    'name': standardized_name,
+                    'original_name': original_name,
+                    'description': wit_description,
+                    'wits_hierarchy_id': wits_hierarchy_id,
+                    'original_hierarchy_level': original_hierarchy_level,
+                    'tenant_id': tenant_id,
+                    'integration_id': integration_id,
+                    'active': True,
+                    'created_at': DateTimeHelper.now_default(),
+                    'last_updated_at': DateTimeHelper.now_default()
+                }
+                result['wits_to_insert'].append(wit_insert_data)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error processing WIT data: {e}")
+            return result
+
+    def _lookup_wit_mapping(self, wit_from: str, integration_id: int, tenant_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Lookup WIT mapping from wits_mappings table based on wit_from (original Jira issuetype name).
+
+        Two-Level Mapping Architecture:
+        - LEVEL 1: Searches for wit_from in wits_mappings table (filtered by integration_id and tenant_id)
+        - If found, returns wit_to and wits_hierarchy_id (FK) from mapping
+
+        Args:
+            wit_from: Original WIT name from Jira (e.g., "Story", "Bug", "Epic")
+            integration_id: Integration ID
+            tenant_id: Tenant ID
+
+        Returns:
+            Dict with 'wit_to', 'wits_hierarchy_id' if found, None otherwise
+        """
+        try:
+            with self.get_db_read_session() as session:
+                query = text("""
+                    SELECT wit_to, wits_hierarchy_id
+                    FROM wits_mappings
+                    WHERE LOWER(wit_from) = LOWER(:wit_from)
+                      AND integration_id = :integration_id
+                      AND tenant_id = :tenant_id
+                      AND active = TRUE
+                    LIMIT 1
+                """)
+
+                result = session.execute(query, {
+                    'wit_from': wit_from,
+                    'integration_id': integration_id,
+                    'tenant_id': tenant_id
+                }).fetchone()
+
+                if result:
+                    return {
+                        'wit_to': result[0],
+                        'wits_hierarchy_id': result[1]
+                    }
+                return None
+
+        except Exception as e:
+            logger.warning(f"Error looking up wit mapping for '{wit_from}': {e}")
+            return None
+
+    def _lookup_hierarchy_by_level(self, level: int, tenant_id: int) -> Optional[int]:
+        """
+        Lookup wits_hierarchy ID by level number (LEVEL 2 mapping).
+
+        This is used when no name mapping is found in wits_mappings.
+
+        Args:
+            level: Hierarchy level number from Jira (e.g., 0, 1, 2, 10001)
+            tenant_id: Tenant ID
+
+        Returns:
+            wits_hierarchy_id (FK) if found, None otherwise
+        """
+        try:
+            with self.get_db_read_session() as session:
+                query = text("""
+                    SELECT id
+                    FROM wits_hierarchies
+                    WHERE level = :level
+                      AND tenant_id = :tenant_id
+                      AND active = TRUE
+                    LIMIT 1
+                """)
+
+                result = session.execute(query, {
+                    'level': level,
+                    'tenant_id': tenant_id
+                }).fetchone()
+
+                return result[0] if result else None
+        except Exception as e:
+            logger.warning(f"Error looking up hierarchy by level {level}: {e}")
+            return None
+
+    def _lookup_category_by_name(self, category_name: str, tenant_id: int) -> Optional[int]:
+        """
+        Lookup status_category ID by category name (LEVEL 2 mapping).
+
+        This is used when no name mapping is found in statuses_mappings.
+
+        Args:
+            category_name: Category name from Jira (e.g., "To Do", "In Progress", "Done")
+            tenant_id: Tenant ID
+
+        Returns:
+            status_category_id (FK) if found, None otherwise
+        """
+        try:
+            with self.get_db_read_session() as session:
+                query = text("""
+                    SELECT id
+                    FROM statuses_categories
+                    WHERE LOWER(name) = LOWER(:category_name)
+                      AND tenant_id = :tenant_id
+                      AND active = TRUE
+                    LIMIT 1
+                """)
+
+                result = session.execute(query, {
+                    'category_name': category_name,
+                    'tenant_id': tenant_id
+                }).fetchone()
+
+                return result[0] if result else None
+        except Exception as e:
+            logger.warning(f"Error looking up category by name '{category_name}': {e}")
+            return None
+
+    def _get_unembedded_entities(self, tenant_id: int, integration_id: int, table_name: str) -> List[Dict[str, Any]]:
+        """
+        Get entities that exist in the database but don't have vectors in qdrant_vectors table.
+
+        This handles the first run scenario where entities were created during custom fields extraction
+        but never embedded because they didn't need updates during regular job execution.
+
+        Args:
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            table_name: Table name ('projects' or 'wits')
+
+        Returns:
+            List of entity dictionaries with 'id' and 'external_id' fields
+        """
+        try:
+            with self.get_db_session() as session:
+                from app.models.unified_models import QdrantVector
+
+                # Query entities that don't have vectors
+                if table_name == 'projects':
+                    from app.models.unified_models import Project
+                    query = text("""
+                        SELECT p.id, p.external_id
+                        FROM projects p
+                        LEFT JOIN qdrant_vectors qv ON qv.table_name = 'projects'
+                            AND qv.record_id = p.id
+                            AND qv.tenant_id = p.tenant_id
+                            AND qv.active = true
+                        WHERE p.tenant_id = :tenant_id
+                            AND p.integration_id = :integration_id
+                            AND p.active = true
+                            AND qv.id IS NULL
+                    """)
+                elif table_name == 'wits':
+                    from app.models.unified_models import Wit
+                    query = text("""
+                        SELECT w.id, w.external_id
+                        FROM wits w
+                        LEFT JOIN qdrant_vectors qv ON qv.table_name = 'wits'
+                            AND qv.record_id = w.id
+                            AND qv.tenant_id = w.tenant_id
+                            AND qv.active = true
+                        WHERE w.tenant_id = :tenant_id
+                            AND w.integration_id = :integration_id
+                            AND w.active = true
+                            AND qv.id IS NULL
+                    """)
+                else:
+                    logger.warning(f"Unsupported table name for unembedded entities check: {table_name}")
+                    return []
+
+                result = session.execute(query, {
+                    'tenant_id': tenant_id,
+                    'integration_id': integration_id
+                }).fetchall()
+
+                unembedded = [{'id': row[0], 'external_id': str(row[1])} for row in result]
+
+                if unembedded:
+                    logger.info(f"🔍 [UNEMBEDDED] Found {len(unembedded)} {table_name} without vectors")
+
+                return unembedded
+
+        except Exception as e:
+            logger.error(f"Error getting unembedded entities for {table_name}: {e}")
+            return []
+
+    def _merge_entity_lists(self, existing_list: List[Dict], new_list: List[Dict]) -> List[Dict]:
+        """
+        Merge two entity lists, avoiding duplicates based on external_id.
+
+        Args:
+            existing_list: List of entities already marked for embedding (from insert/update)
+            new_list: List of unembedded entities to add
+
+        Returns:
+            Merged list without duplicates
+        """
+        # Create a set of external_ids from existing list
+        existing_external_ids = {entity.get('external_id') for entity in existing_list if entity.get('external_id')}
+
+        # Add entities from new_list that aren't already in existing_list
+        for entity in new_list:
+            external_id = entity.get('external_id')
+            if external_id and external_id not in existing_external_ids:
+                existing_list.append(entity)
+                existing_external_ids.add(external_id)
+
+        return existing_list
+
+    def _process_custom_field_data(
+        self,
+        field_key: str,
+        field_info: Dict[str, Any],
+        tenant_id: int,
+        integration_id: int,
+        existing_custom_fields: Dict[str, CustomField]
+    ) -> Dict[str, List]:
+        """Process custom field data using new schema (external_id, field_type, no project_id)."""
+        result = {
+            'custom_fields_to_insert': [],
+            'custom_fields_to_update': []
+        }
+
+        try:
+            field_name = field_info.get('name', '')
+            field_schema = field_info.get('schema', {})
+            field_type = field_schema.get('type', 'string')
+            operations = field_info.get('operations', [])
+
+            if not field_name:
+                return result
+
+            if field_key in existing_custom_fields:
+                # Check if custom field needs update
+                existing_cf = existing_custom_fields[field_key]
+                if (existing_cf.name != field_name or
+                    existing_cf.field_type != field_type):
+                    import json
+                    result['custom_fields_to_update'].append({
+                        'id': existing_cf.id,
+                        'name': field_name,
+                        'field_type': field_type,
+                        'operations': json.dumps(operations) if operations else '[]',  # Convert to JSON string
+                        'last_updated_at': DateTimeHelper.now_default()
+                    })
+            else:
+                # New custom field (global, no project_id)
+                import json
+                cf_insert_data = {
+                    'name': field_name,
+                    'external_id': field_key,
+                    'field_type': field_type,
+                    'operations': json.dumps(operations) if operations else '[]',  # Convert to JSON string
+                    'tenant_id': tenant_id,
+                    'integration_id': integration_id,
+                    'active': True,
+                    'created_at': DateTimeHelper.now_default(),
+                    'last_updated_at': DateTimeHelper.now_default()
+                }
+                result['custom_fields_to_insert'].append(cf_insert_data)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error processing custom field data: {e}")
+            return result
+
+    def _perform_bulk_operations(
+        self,
+        session,
+        projects_to_insert: List[Dict],
+        projects_to_update: List[Dict],
+        wits_to_insert: List[Dict],
+        wits_to_update: List[Dict],
+        custom_fields_to_insert: List[Dict],
+        custom_fields_to_update: List[Dict],
+        project_wit_relationships: List[tuple]
+    ):
+        """
+        Perform bulk database operations.
+
+        NOTE: This method only performs database operations.
+        Vectorization queueing should be done AFTER commit by the caller.
+        """
+        try:
+            # 1. Bulk insert projects first
+            if projects_to_insert:
+                BulkOperations.bulk_insert(session, 'projects', projects_to_insert)
+                logger.debug(f"Inserted {len(projects_to_insert)} projects")
+
+            # 2. Bulk update projects
+            if projects_to_update:
+                BulkOperations.bulk_update(session, 'projects', projects_to_update)
+                logger.debug(f"Updated {len(projects_to_update)} projects")
+
+            # 3. Bulk insert WITs
+            if wits_to_insert:
+                BulkOperations.bulk_insert(session, 'wits', wits_to_insert)
+                logger.debug(f"Inserted {len(wits_to_insert)} WITs")
+
+            # 4. Bulk update WITs
+            if wits_to_update:
+                BulkOperations.bulk_update(session, 'wits', wits_to_update)
+                logger.debug(f"Updated {len(wits_to_update)} WITs")
+
+            # 5. Bulk insert custom fields (global, no project relationship)
+            if custom_fields_to_insert:
+                # Deduplicate by external_id to avoid unique constraint violations
+                unique_custom_fields = {}
+                for cf in custom_fields_to_insert:
+                    external_id = cf.get('external_id')
+                    if external_id and external_id not in unique_custom_fields:
+                        unique_custom_fields[external_id] = cf
+
+                deduplicated_custom_fields = list(unique_custom_fields.values())
+                if deduplicated_custom_fields:
+                    BulkOperations.bulk_insert(session, 'custom_fields', deduplicated_custom_fields)
+                    logger.debug(f"Inserted {len(deduplicated_custom_fields)} custom fields (deduplicated from {len(custom_fields_to_insert)})")
+                # Note: Custom fields are not vectorized (they're metadata)
+
+            # 6. Bulk update custom fields
+            if custom_fields_to_update:
+                BulkOperations.bulk_update(session, 'custom_fields', custom_fields_to_update)
+                logger.debug(f"Updated {len(custom_fields_to_update)} custom fields")
+                # Note: Custom fields are not vectorized (they're metadata)
+
+            # 7. Project-WIT relationships are handled separately using _create_project_wit_relationships_for_search
+            # This ensures proper error handling and data validation
+
+            # Return the entities that need vectorization (caller will queue after commit)
+            return {
+                'projects_to_insert': projects_to_insert,
+                'projects_to_update': projects_to_update,
+                'wits_to_insert': wits_to_insert,
+                'wits_to_update': wits_to_update
+            }
+
+        except Exception as e:
+            logger.error(f"Error in bulk operations: {e}")
+            raise
+
+    async def _process_jira_statuses_and_project_relationships(self, raw_data_id: int, tenant_id: int, integration_id: int, job_id: int = None, message: Dict[str, Any] = None) -> bool:
+        """
+        Process statuses and project relationships from raw data.
+
+        This function:
+        1. Retrieves raw data from raw_extraction_data table
+        2. Processes statuses and saves to statuses table with mapping links
+        3. Processes project-status relationships and saves to projects_statuses table
+        4. Returns success status
+
+        Args:
+            message: Full message dict with flags (must include 'type' field for step name)
+        """
+        try:
+            # Extract step name from message
+            step_name = message.get('type', 'jira_statuses_and_relationships') if message else 'jira_statuses_and_relationships'
+            logger.info(f"🏁 [STATUSES] Starting statuses and project relationships processing (raw_data_id={raw_data_id})")
+
+            # NOTE: Status updates are handled by TransformWorker router (lines 138-148, 276-283)
+            # Do NOT send status updates from handler to avoid event loop conflicts
+
+            with self.get_db_session() as db:
+                # Load raw data
+                raw_data_query = text("""
+                    SELECT raw_data
+                    FROM raw_extraction_data
+                    WHERE id = :raw_data_id AND tenant_id = :tenant_id
+                """)
+                result = db.execute(raw_data_query, {'raw_data_id': raw_data_id, 'tenant_id': tenant_id}).fetchone()
+
+                if not result:
+                    logger.error(f"No raw data found for id {raw_data_id}")
+                    return False
+
+                raw_data_json = result[0]
+                payload = raw_data_json if isinstance(raw_data_json, dict) else json.loads(raw_data_json)
+
+                # Handle three formats:
+                # 1. Combined format (NEW): {'projects': [{'project_key': 'X', 'statuses': [...]}, ...]}
+                # 2. Individual project format: {'project_key': 'BEN', 'statuses': [...]}
+                # 3. Old consolidated format: {'statuses': [...], 'project_statuses': [...]}
+
+                if "projects" in payload:
+                    # NEW Combined format: {'projects': [{'project_key': 'X', 'statuses': [...]}, ...]}
+                    all_projects = payload.get("projects", [])
+                    logger.info(f"📦 Processing combined payload with {len(all_projects)} projects")
+
+                    # Extract unique statuses across ALL projects
+                    unique_statuses = {}
+                    project_relationships = []
+
+                    for project_data in all_projects:
+                        project_key = project_data.get("project_key")
+                        project_statuses_response = project_data.get("statuses", [])
+
+                        logger.debug(f"Processing project {project_key} with {len(project_statuses_response)} issue types")
+
+                        for issuetype_data in project_statuses_response:
+                            for status_data in issuetype_data.get('statuses', []):
+                                status_external_id = status_data.get('id')
+                                if status_external_id:
+                                    # Collect unique statuses (deduplication happens here)
+                                    if status_external_id not in unique_statuses:
+                                        unique_statuses[status_external_id] = status_data
+
+                                    # Create project-status relationship
+                                    project_relationships.append({
+                                        'project_key': project_key,
+                                        'status_id': status_external_id,
+                                        'status_name': status_data.get('name'),
+                                        'issue_type_id': issuetype_data.get('id'),
+                                        'issue_type_name': issuetype_data.get('name')
+                                    })
+
+                    statuses_data = list(unique_statuses.values())
+                    project_statuses_data = project_relationships
+
+                    logger.info(f"📊 Extracted {len(statuses_data)} unique statuses and {len(project_statuses_data)} project-status relationships")
+
+                elif "project_key" in payload:
+                    # Individual project format: {'project_key': 'BEN', 'statuses': [...]}
+                    project_key = payload.get("project_key")
+                    project_statuses_response = payload.get("statuses", [])
+
+                    logger.debug(f"Processing individual project {project_key} with {len(project_statuses_response)} issue types")
+
+                    # Extract unique statuses from this project
+                    unique_statuses = {}
+                    project_relationships = []
+
+                    for issuetype_data in project_statuses_response:
+                        for status_data in issuetype_data.get('statuses', []):
+                            status_external_id = status_data.get('id')
+                            if status_external_id:
+                                # Collect unique statuses
+                                if status_external_id not in unique_statuses:
+                                    unique_statuses[status_external_id] = status_data
+
+                                # Create project-status relationship
+                                project_relationships.append({
+                                    'project_key': project_key,
+                                    'status_id': status_external_id,
+                                    'status_name': status_data.get('name'),
+                                    'issue_type_id': issuetype_data.get('id'),
+                                    'issue_type_name': issuetype_data.get('name')
+                                })
+
+                    statuses_data = list(unique_statuses.values())
+                    project_statuses_data = project_relationships
+
+                else:
+                    # Old consolidated format: {'statuses': [...], 'project_statuses': [...]}
+                    statuses_data = payload.get("statuses", [])
+                    project_statuses_data = payload.get("project_statuses", [])
+
+                logger.debug(f"Processing {len(statuses_data)} statuses and {len(project_statuses_data)} project relationships")
+
+                # Process statuses and project relationships (returns entities for vectorization)
+                statuses_result = self._process_statuses_data(db, statuses_data, integration_id, tenant_id)
+                relationships_processed = self._process_project_status_relationships_data(db, project_statuses_data, integration_id, tenant_id)
+
+                # Update raw data status to completed
+                from app.core.utils import DateTimeHelper
+                now = DateTimeHelper.now_default()
+
+                update_query = text("""
+                    UPDATE raw_extraction_data
+                    SET status = 'completed',
+                        last_updated_at = :now,
+                        error_details = NULL
+                    WHERE id = :raw_data_id
+                """)
+                db.execute(update_query, {'raw_data_id': raw_data_id, 'now': now})
+
+                # Commit all changes BEFORE queueing for vectorization
+                db.commit()
+
+                # Queue statuses for embedding AFTER commit
+                # Get message info for forwarding
+                provider = message.get('provider') if message else 'jira'
+                new_last_sync_date = message.get('new_last_sync_date') if message else None
+
+                # 🎯 NEW LOGIC: Only queue to embedding when last_item=True
+                # This ensures we process all projects first, then query all distinct statuses once
+                # This avoids duplicate embeddings for the same status across different projects
+
+                statuses_processed = statuses_result['count']
+                logger.debug(f"Successfully processed {statuses_processed} statuses and {relationships_processed} project relationships")
+
+                # 🎯 DEBUG: Log message details
+                logger.debug(f"🎯 [STATUSES] Message check: message={message is not None}, last_item={message.get('last_item') if message else 'N/A'}")
+
+                if message and message.get('last_item'):
+                    logger.debug(f"🎯 [STATUSES] Last item received - checking for updated statuses")
+
+                    # Get message info for forwarding
+                    provider = message.get('provider') if message else 'jira'
+                    old_last_sync_date = message.get('old_last_sync_date') if message else None  # 🔑 From extraction worker
+                    new_last_sync_date = message.get('new_last_sync_date') if message else None  # 🔑 Extraction start time
+                    last_job_item = message.get('last_job_item', False)
+                    first_item_flag = message.get('first_item', False)
+                    token = message.get('token')  # 🔑 Extract token from message
+
+                    # 🎯 Query statuses that need embedding
+                    # Since new_last_sync_date is set BEFORE extraction starts, all statuses
+                    # inserted/updated during this run will have last_updated_at >= new_last_sync_date
+                    # - First run: all statuses inserted → all have last_updated_at >= new_last_sync_date
+                    # - Incremental run: only changed statuses updated → only those have last_updated_at >= new_last_sync_date
+
+                    # 🔑 Convert new_last_sync_date string to datetime object for proper comparison
+                    # This ensures PostgreSQL interprets the timezone correctly
+                    from datetime import datetime
+                    new_last_sync_dt = datetime.strptime(new_last_sync_date, '%Y-%m-%d %H:%M:%S')
+
+                    # 🔍 DEBUG: Check what values we're comparing
+                    logger.debug(f"🔍 [DEBUG] new_last_sync_date = {new_last_sync_date} (New York time)")
+                    logger.debug(f"🔍 [DEBUG] new_last_sync_dt = {new_last_sync_dt} (datetime object)")
+
+                    logger.debug(f"🎯 [STATUSES] Querying statuses updated since {new_last_sync_date}")
+                    statuses_query = text("""
+                        SELECT external_id
+                        FROM statuses
+                        WHERE tenant_id = :tenant_id
+                            AND integration_id = :integration_id
+                            AND active = true
+                            AND last_updated_at >= :new_last_sync_date
+                        ORDER BY external_id
+                    """)
+
+                    with self.get_db_session() as db_read:
+                        status_rows = db_read.execute(statuses_query, {
+                            'tenant_id': tenant_id,
+                            'integration_id': integration_id,
+                            'new_last_sync_date': new_last_sync_dt  # Pass datetime object, not string
+                        }).fetchall()
+
+                    status_external_ids = [row[0] for row in status_rows]
+                    logger.info(f"🎯 [STATUSES] Found {len(status_external_ids)} statuses that need embedding")
+
+                    # 🎯 HANDLE NO UPDATED STATUSES: If no statuses were updated, mark both transform and embedding as finished
+                    if not status_external_ids:
+                        logger.info(f"🎯 [STATUSES] No updated statuses found - marking transform and embedding as finished")
+
+                        # 🎯 OPTION 1: Mark both steps as finished directly (current approach)
+                        # This avoids sending unnecessary completion messages through the queue
+                        await self._send_worker_status('transform', tenant_id, job_id, 'finished', step_name)
+                        await self._send_worker_status('embedding', tenant_id, job_id, 'finished', step_name)
+                        logger.debug(f"✅ [STATUSES] Both transform and embedding steps marked as finished (no updated statuses)")
+
+                        # 🎯 OPTION 2: Send completion message to embedding (uncomment if you want the message to flow through embedding worker)
+                        # self._queue_entities_for_embedding(
+                        #     tenant_id=tenant_id,
+                        #     table_name='statuses',
+                        #     entities=[],  # Empty list signals completion
+                        #     job_id=job_id,
+                        #     message_type='jira_statuses_and_relationships',
+                        #     integration_id=integration_id,
+                        #     provider=provider,
+                        #     old_last_sync_date=old_last_sync_date,
+                        #     new_last_sync_date=new_last_sync_date,
+                        #     first_item=first_item_flag,  # Preserve first_item flag
+                        #     last_item=True,  # This is the last (and only) message
+                        #     last_job_item=last_job_item,  # Preserve last_job_item flag
+                        #     token=token
+                        # )
+                        # logger.debug(f"✅ [STATUSES] Completion message sent to embedding (no updated statuses)")
+                    else:
+                        # 🚀 Queue statuses in batches of 100 (similar to projects/WITs)
+                        BATCH_SIZE = 100
+                        total_statuses = len(status_external_ids)
+                        total_batches = (total_statuses + BATCH_SIZE - 1) // BATCH_SIZE
+
+                        logger.info(f"📦 [STATUSES] Batching {total_statuses} statuses into {total_batches} batches of {BATCH_SIZE}")
+
+                        # Queue batches
+                        for batch_idx in range(total_batches):
+                            start_idx = batch_idx * BATCH_SIZE
+                            end_idx = min(start_idx + BATCH_SIZE, total_statuses)
+                            batch_status_ids = status_external_ids[start_idx:end_idx]
+
+                            # Build entities list for batch
+                            batch_entities = [{'external_id': external_id} for external_id in batch_status_ids]
+
+                            is_first = (batch_idx == 0)
+                            is_last = (batch_idx == total_batches - 1)
+
+                            logger.info(f"📤 [STATUSES] Queuing batch {batch_idx + 1}/{total_batches}: {len(batch_entities)} statuses, first={is_first}, last={is_last}")
+
+                            self._queue_entities_for_embedding(
+                                tenant_id, 'statuses',
+                                batch_entities,
+                                job_id,
+                                message_type=step_name,
+                                integration_id=integration_id,
+                                provider=provider,
+                                old_last_sync_date=old_last_sync_date,  # 🔑 Forward old_last_sync_date
+                                new_last_sync_date=new_last_sync_date,
+                                first_item=is_first,
+                                last_item=is_last,
+                                last_job_item=last_job_item,
+                                token=token  # 🔑 Include token in message
+                            )
+
+                        logger.info(f"✅ [STATUSES] Queued {total_statuses} statuses in {total_batches} batches to embedding")
+
+                        # ✅ Send WebSocket status update immediately after queuing
+                        # This updates database and sends WebSocket notification to UI
+                        if job_id:
+                            logger.debug(f"🏁 [STATUSES] Sending 'finished' status for transform step ({step_name})")
+                            await self._send_worker_status('transform', tenant_id, job_id, 'finished', step_name)
+                            logger.debug(f"✅ [STATUSES] Transform step marked as finished and WebSocket notification sent")
+                else:
+                    logger.debug(f"🎯 [STATUSES] Not last item (first_item={message.get('first_item') if message else False}, last_item={message.get('last_item') if message else False}) - skipping embedding queue")
+
+                logger.info(f"✅ [STATUSES] Completed statuses and project relationships processing (raw_data_id={raw_data_id})")
+                return True
+
+        except Exception as e:
+            logger.error(f"Error processing statuses and project relationships: {e}")
+            return False
+
+    def _process_statuses_data(self, db, statuses_data: List[Dict], integration_id: int, tenant_id: int) -> Dict[str, Any]:
+        """
+        Process and bulk insert/update statuses with two-level FK-based mapping architecture.
+
+        Two-Level Mapping:
+        - LEVEL 1: Check statuses_mappings by name -> get status_to and status_category_id (FK)
+        - LEVEL 2: If no mapping, lookup statuses_categories by original_category -> get status_category_id (FK)
+        - FALLBACK: If no match at either level, status_category_id = NULL
+        - Always preserve original values in original_name and original_category
+
+        Returns:
+            Dict with 'count', 'statuses_to_insert', and 'statuses_to_update'
+        """
+        try:
+            from app.core.utils import DateTimeHelper
+
+            statuses_to_insert = []
+            statuses_to_update = []
+            now = DateTimeHelper.now_default()
+
+            # 🔍 DEBUG: Check what timezone is actually being used
+            logger.debug(f"🔍 now = {now} (should be New York time)")
+
+            # Get existing statuses
+            existing_query = text("""
+                SELECT external_id, id, name, original_name, status_category_id, original_category, description
+                FROM statuses
+                WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+            """)
+            existing_results = db.execute(existing_query, {
+                'integration_id': integration_id,
+                'tenant_id': tenant_id
+            }).fetchall()
+
+            existing_statuses = {row[0]: row for row in existing_results}
+
+            # Get status mappings with category ID (LEVEL 1)
+            mappings_query = text("""
+                SELECT status_from, status_to, status_category_id
+                FROM statuses_mappings
+                WHERE integration_id = :integration_id AND tenant_id = :tenant_id AND active = TRUE
+            """)
+            mappings_results = db.execute(mappings_query, {
+                'integration_id': integration_id,
+                'tenant_id': tenant_id
+            }).fetchall()
+
+            # Create mapping lookup: status_from -> (status_to, status_category_id)
+            # Use lowercase keys for case-insensitive matching
+            status_mapping_lookup = {row[0].lower(): (row[1], row[2]) for row in mappings_results}
+            logger.debug(f"Found {len(status_mapping_lookup)} status mappings: {list(status_mapping_lookup.keys())}")
+
+            # Process each status
+            for status_data in statuses_data:
+                external_id = status_data.get('id')
+                original_name = status_data.get('name', '')
+                description = status_data.get('description', '')
+                original_category = status_data.get('statusCategory', {}).get('name', '')
+
+                # TWO-LEVEL MAPPING LOGIC
+                # LEVEL 1: Check statuses_mappings by name (case-insensitive)
+                mapping = status_mapping_lookup.get(original_name.lower())
+                if mapping:
+                    # Use standardized values from mapping
+                    standardized_name = mapping[0]  # status_to
+                    status_category_id = mapping[1]  # FK from mapping
+                    logger.debug(f"[LEVEL 1] Applied mapping for '{original_name}' -> '{standardized_name}' (category_id: {status_category_id})")
+                else:
+                    # LEVEL 2: No mapping - use original name and lookup category by name
+                    standardized_name = original_name
+                    status_category_id = self._lookup_category_by_name(original_category, tenant_id)
+                    if status_category_id:
+                        logger.debug(f"[LEVEL 2] No mapping for '{original_name}', found category by name '{original_category}' -> category_id: {status_category_id}")
+                    else:
+                        logger.debug(f"[FALLBACK] No mapping and no category found for '{original_name}' (category: '{original_category}') -> category_id: NULL")
+
+                if external_id in existing_statuses:
+                    # Update existing status
+                    existing = existing_statuses[external_id]
+                    # existing: (external_id, id, name, original_name, status_category_id, original_category, description)
+                    if (existing[2] != standardized_name or existing[3] != original_name or
+                        existing[4] != status_category_id or existing[5] != original_category or
+                        existing[6] != description):
+                        statuses_to_update.append({
+                            'id': existing[1],
+                            'external_id': external_id,  # Add external_id for vectorization
+                            'name': standardized_name,
+                            'original_name': original_name,
+                            'status_category_id': status_category_id,
+                            'original_category': original_category,
+                            'description': description
+                        })
+                else:
+                    # Insert new status
+                    statuses_to_insert.append({
+                        'external_id': external_id,
+                        'name': standardized_name,
+                        'original_name': original_name,
+                        'status_category_id': status_category_id,
+                        'original_category': original_category,
+                        'description': description,
+                        'integration_id': integration_id,
+                        'tenant_id': tenant_id
+                    })
+
+            # Bulk insert new statuses with ON CONFLICT DO NOTHING to avoid deadlocks
+            # When multiple workers process the same statuses, DO NOTHING prevents lock conflicts
+            if statuses_to_insert:
+                # Add timestamps to each record
+                for status in statuses_to_insert:
+                    status['created_at'] = now
+                    status['last_updated_at'] = now
+
+                # CRITICAL: Sort by external_id to prevent deadlocks
+                # Multiple workers must acquire locks in the same order
+                statuses_to_insert.sort(key=lambda x: x['external_id'])
+
+                insert_query = text("""
+                    INSERT INTO statuses (
+                        external_id, name, original_name, description, status_category_id, original_category,
+                        integration_id, tenant_id, active, created_at, last_updated_at
+                    ) VALUES (
+                        :external_id, :name, :original_name, :description, :status_category_id, :original_category,
+                        :integration_id, :tenant_id, TRUE, :created_at, :last_updated_at
+                    )
+                    ON CONFLICT (external_id, tenant_id, integration_id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        original_name = EXCLUDED.original_name,
+                        description = EXCLUDED.description,
+                        status_category_id = EXCLUDED.status_category_id,
+                        original_category = EXCLUDED.original_category,
+                        last_updated_at = EXCLUDED.last_updated_at
+                """)
+                db.execute(insert_query, statuses_to_insert)
+                logger.info(f"✅ Inserted {len(statuses_to_insert)} new statuses (skipped existing)")
+
+            # Bulk update existing statuses
+            if statuses_to_update:
+                # Add timestamp to each record
+                for status in statuses_to_update:
+                    status['last_updated_at'] = now
+
+                # CRITICAL: Sort by id to prevent deadlocks
+                # Multiple workers must acquire locks in the same order
+                statuses_to_update.sort(key=lambda x: x['id'])
+
+                update_query = text("""
+                    UPDATE statuses
+                    SET name = :name, original_name = :original_name,
+                        status_category_id = :status_category_id, original_category = :original_category,
+                        description = :description, last_updated_at = :last_updated_at
+                    WHERE id = :id
+                """)
+                db.execute(update_query, statuses_to_update)
+                logger.info(f"✅ Updated {len(statuses_to_update)} existing statuses with last_updated_at={now}")
+
+            # Return entities for vectorization (to be queued AFTER commit)
+            return {
+                'count': len(statuses_to_insert) + len(statuses_to_update),
+                'statuses_to_insert': statuses_to_insert,
+                'statuses_to_update': statuses_to_update
+            }
+
+        except Exception as e:
+            logger.error(f"Error processing statuses data: {e}")
+            raise
+
+    def _process_project_status_relationships_data(self, db, project_statuses_data: List[Dict], integration_id: int, tenant_id: int) -> int:
+        """Process and bulk insert/update project-status relationships."""
+        try:
+            relationships_to_insert = []
+
+            # Get existing projects mapping (both external_id and key -> internal_id)
+            projects_query = text("""
+                SELECT external_id, key, id
+                FROM projects
+                WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+            """)
+            projects_results = db.execute(projects_query, {
+                'integration_id': integration_id,
+                'tenant_id': tenant_id
+            }).fetchall()
+
+            projects_lookup = {row[0]: row[2] for row in projects_results}  # external_id -> internal_id
+            projects_key_lookup = {row[1]: row[2] for row in projects_results}  # key -> internal_id
+            logger.debug(f"Found {len(projects_lookup)} projects for relationship mapping")
+
+            # Get existing statuses mapping (external_id -> internal_id)
+            statuses_query = text("""
+                SELECT external_id, id
+                FROM statuses
+                WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+            """)
+            statuses_results = db.execute(statuses_query, {
+                'integration_id': integration_id,
+                'tenant_id': tenant_id
+            }).fetchall()
+
+            statuses_lookup = {row[0]: row[1] for row in statuses_results}
+            logger.debug(f"Found {len(statuses_lookup)} statuses for relationship mapping")
+
+            # Get existing relationships to avoid duplicates
+            existing_relationships_query = text("""
+                SELECT project_id, status_id
+                FROM projects_statuses
+            """)
+            existing_relationships = db.execute(existing_relationships_query).fetchall()
+            existing_pairs = {(row[0], row[1]) for row in existing_relationships}
+
+            # Process each project-status relationship
+            for project_status_data in project_statuses_data:
+                # Handle both old and new formats
+                if 'project_key' in project_status_data:
+                    # New format: {'project_key': 'BEN', 'status_id': '123', ...}
+                    project_key = project_status_data.get('project_key')
+                    project_internal_id = projects_key_lookup.get(project_key)
+                    status_external_id = project_status_data.get('status_id')
+
+                    if not project_internal_id:
+                        logger.warning(f"Project with key {project_key} not found in projects table")
+                        continue
+
+                    status_internal_id = statuses_lookup.get(status_external_id)
+
+                    if not status_internal_id:
+                        logger.warning(f"Status {status_external_id} not found in statuses table")
+                        continue
+
+                    # Check if relationship already exists
+                    relationship_pair = (project_internal_id, status_internal_id)
+                    if relationship_pair not in existing_pairs:
+                        relationships_to_insert.append({
+                            'project_id': project_internal_id,
+                            'status_id': status_internal_id
+                        })
+                        existing_pairs.add(relationship_pair)
+
+                else:
+                    # Old format: {'project_id': '123', 'statuses': [...]}
+                    project_external_id = project_status_data.get('project_id')
+                    project_internal_id = projects_lookup.get(project_external_id)
+
+                    if not project_internal_id:
+                        logger.warning(f"Project {project_external_id} not found in projects table")
+                        continue
+
+                    statuses = project_status_data.get('statuses', [])
+
+                    # Process each issue type's statuses
+                    for issue_type_statuses in statuses:
+                        if isinstance(issue_type_statuses, dict) and 'statuses' in issue_type_statuses:
+                            for status_data in issue_type_statuses['statuses']:
+                                status_external_id = status_data.get('id')
+                                status_internal_id = statuses_lookup.get(status_external_id)
+
+                                if not status_internal_id:
+                                    logger.warning(f"Status {status_external_id} not found in statuses table")
+                                    continue
+
+                                # Check if relationship already exists
+                                relationship_pair = (project_internal_id, status_internal_id)
+                                if relationship_pair not in existing_pairs:
+                                    relationships_to_insert.append({
+                                        'project_id': project_internal_id,
+                                        'status_id': status_internal_id
+                                    })
+                                    existing_pairs.add(relationship_pair)
+
+            # Bulk insert new relationships
+            if relationships_to_insert:
+                insert_query = text("""
+                    INSERT INTO projects_statuses (project_id, status_id)
+                    VALUES (:project_id, :status_id)
+                    ON CONFLICT (project_id, status_id) DO NOTHING
+                """)
+                db.execute(insert_query, relationships_to_insert)
+                logger.debug(f"Inserted {len(relationships_to_insert)} new project-status relationships")
+
+            return len(relationships_to_insert)
+
+        except Exception as e:
+            logger.error(f"Error processing project-status relationships data: {e}")
+            raise
+
+    def _queue_entities_for_embedding(
+        self,
+        tenant_id: int,
+        table_name: str,
+        entities: List[Dict[str, Any]],
+        job_id: int = None,
+        last_item: bool = False,
+        provider: str = None,
+        old_last_sync_date: str = None,  # 🔑 Old last sync date (for filtering)
+        new_last_sync_date: str = None,  # 🔑 New last sync date (for job completion)
+        message_type: str = None,
+        integration_id: int = None,
+        first_item: bool = False,
+        last_job_item: bool = False,
+        token: str = None  # 🔑 Job execution token
+    ):
+        """
+        Queue entities for embedding by publishing messages to embedding queue.
+
+        This method is used for ALL entity types (projects, WITs, statuses, issues, changelogs, etc.).
+        It loops through the entities list and publishes one message per entity to the embedding queue.
+
+        Args:
+            tenant_id: Tenant ID
+            table_name: Name of the table (projects, wits, statuses, work_items, etc.)
+            entities: List of entity dictionaries with external_id or key
+            job_id: ETL job ID
+            last_item: Whether this is the last batch in the step
+            provider: Provider name (jira, github, etc.)
+            old_last_sync_date: Old last sync date used for filtering
+            new_last_sync_date: New last sync date to update on completion (extraction end date)
+            message_type: ETL step type for status tracking
+            integration_id: Integration ID
+            first_item: Whether this is the first batch in the step
+            last_job_item: Whether this is the final batch in the entire job
+            token: Job execution token for tracking messages through pipeline
+        """
+        # 🎯 HANDLE COMPLETION MESSAGE: Empty entities with last_job_item=True
+        if not entities and last_job_item:
+            logger.debug(f"[COMPLETION] Sending job completion message to embedding queue (no {table_name} entities)")
+
+            # Send completion message to embedding queue with external_id=None
+            if not self.queue_manager:
+                logger.error("QueueManager not available - cannot send completion message")
+                return
+
+            success = self.queue_manager.publish_embedding_job(
+                tenant_id=tenant_id,
+                table_name=table_name,
+                external_id=None,  # 🔧 None signals completion message
+                job_id=job_id,
+                integration_id=integration_id,
+                provider=provider,
+                old_last_sync_date=old_last_sync_date,  # 🔑 Old last sync date (for filtering)
+                new_last_sync_date=new_last_sync_date,  # 🔑 New last sync date (for job completion)
+                first_item=first_item,
+                last_item=last_item,
+                last_job_item=last_job_item,  # 🎯 Signal job completion
+                step_type=message_type,
+                token=token  # 🔑 Include token in message
+            )
+
+            if success:
+                logger.debug(f"✅ Sent completion message to embedding queue for {table_name}")
+            else:
+                logger.error(f"❌ Failed to send completion message to embedding queue for {table_name}")
+
+            return
+
+        if not entities:
+            # 🎯 FLAG MESSAGE: If entities is empty but we have first_item=True OR last_item=True, publish flag message
+            # This ensures WebSocket status updates are sent even when there are no entities to process
+            if first_item or last_item:
+                logger.debug(f"🎯 [FLAG-MESSAGE] Publishing flag message to embedding queue for {table_name} (first={first_item}, last={last_item})")
+                if not self.queue_manager:
+                    logger.error("QueueManager not available - cannot send flag message")
+                    return
+
+                success = self.queue_manager.publish_embedding_job(
+                    tenant_id=tenant_id,
+                    table_name=table_name,
+                    external_id=None,  # 🔑 Key: None signals flag/completion message
+                    job_id=job_id,
+                    integration_id=integration_id,
+                    provider=provider,
+                    old_last_sync_date=old_last_sync_date,  # 🔑 Old last sync date (for filtering)
+                    new_last_sync_date=new_last_sync_date,  # 🔑 New last sync date (for job completion)
+                    first_item=first_item,    # ✅ Preserved (could be True for 'running' status)
+                    last_item=last_item,      # ✅ Preserved (could be True for 'finished' status)
+                    last_job_item=last_job_item,  # ✅ Preserved
+                    step_type=message_type,
+                    token=token  # 🔑 Include token in message
+                )
+                logger.debug(f"🎯 [FLAG-MESSAGE] Embedding flag message published: {success}")
+            else:
+                logger.debug(f"No entities to queue for {table_name}")
+            return
+
+        try:
+            logger.debug(f"Attempting to queue {len(entities)} {table_name} entities for embedding")
+            if not self.queue_manager:
+                logger.error("QueueManager not available - cannot queue entities for embedding")
+                return
+
+            queued_count = 0
+
+            # Update step status to running when queuing for embedding
+            if job_id and queued_count == 0:  # Only on first entity to avoid multiple updates
+                # Don't update overall status here - let embedding worker handle completion
+                logger.debug(f"Transform completed, queuing {table_name} for embedding")
+
+            # 🚀 PERFORMANCE: Use shared channel for batch publishing (same pattern as extraction worker)
+            import pika
+            import json
+
+            with self.queue_manager.get_channel() as channel:
+                # 🔑 Check if this is a batch message (multiple entities in one message)
+                # ALL Config job tables + ALL Jira job tables use batch mode for performance
+                batch_enabled_tables = ['custom_fields', 'wits_hierarchies', 'wits_mappings', 'statuses_mappings', 'workflows', 'work_items', 'changelogs', 'projects', 'wits', 'statuses', 'sprints', 'work_items_prs_links']
+                is_batch_mode = (table_name in batch_enabled_tables and len(entities) > 1)
+
+                if is_batch_mode:
+                    # 🚀 BATCH MODE: Send ONE message with ALL entities
+                    logger.info(f"📦 [BATCH-MODE] Queuing {len(entities)} {table_name} entities in ONE batch message")
+
+                    message = {
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id,
+                        'job_id': job_id,
+                        'type': message_type,  # ETL step name for status tracking
+                        'provider': provider,
+                        'first_item': first_item,
+                        'last_item': last_item,
+                        'old_last_sync_date': old_last_sync_date,
+                        'new_last_sync_date': new_last_sync_date,
+                        'last_job_item': last_job_item,
+                        'token': token,
+                        'rate_limited': False,
+                        # Transform → Embedding specific fields
+                        'table_name': table_name,
+                        'entities': entities,  # 🔑 NEW: Send entire batch
+                        'external_id': 'batch'  # 🔑 Use 'batch' to signal batch mode (not None to avoid completion message handler)
+                    }
+
+                    # Publish using shared channel
+                    tier = self.queue_manager._get_tenant_tier(tenant_id)
+                    tier_queue = self.queue_manager.get_tier_queue_name(tier, 'embedding')
+
+                    channel.basic_publish(
+                        exchange='',
+                        routing_key=tier_queue,
+                        body=json.dumps(message, cls=DateTimeEncoder),  # Use custom encoder for datetime objects
+                        properties=pika.BasicProperties(
+                            delivery_mode=2,
+                            content_type='application/json'
+                        )
+                    )
+
+                    queued_count = len(entities)
+                    logger.info(f"✅ [BATCH-MODE] Queued 1 batch message with {queued_count} {table_name} entities")
+
+                else:
+                    # 🔄 INDIVIDUAL MODE: Send one message per entity (backward compatible)
+                    for idx, entity in enumerate(entities):
+                        # Get external ID - work_items_prs_links uses internal ID, all others use external_id
+                        if table_name == 'work_items_prs_links':
+                            external_id = str(entity.get('id'))
+                        else:
+                            external_id = entity.get('external_id')
+
+                        if not external_id:
+                            logger.warning(f"No external_id found for {table_name} entity: {entity}")
+                            continue
+
+                        # Calculate flags for this entity using enumerate index (not queued_count)
+                        entity_first_item = first_item and (idx == 0)
+                        entity_last_item = last_item and (idx == len(entities) - 1)
+
+                        # 🔑 CRITICAL: Only the LAST entity should have last_job_item=True
+                        # This prevents premature job completion when multiple entities are being processed
+                        entity_last_job_item = last_job_item and (idx == len(entities) - 1)
+
+                        # 🎯 DEBUG: Log flags for first and last entities
+                        if idx == 0 or idx == len(entities) - 1:
+                            logger.info(f"🎯 [EMBEDDING-QUEUE] Entity {idx+1}/{len(entities)}: table={table_name}, external_id={external_id}, first_item={entity_first_item}, last_item={entity_last_item}, last_job_item={entity_last_job_item}, incoming_first={first_item}, incoming_last={last_item}, incoming_last_job_item={last_job_item}")
+
+                        # Build embedding message
+                        message = {
+                            'tenant_id': tenant_id,
+                            'integration_id': integration_id,
+                            'job_id': job_id,
+                            'type': message_type,  # ETL step name for status tracking
+                            'provider': provider,
+                            'first_item': entity_first_item,
+                            'last_item': entity_last_item,
+                            'old_last_sync_date': old_last_sync_date,
+                            'new_last_sync_date': new_last_sync_date,
+                            'last_job_item': entity_last_job_item,  # 🔑 Only TRUE for the very last entity
+                            'token': token,
+                            'rate_limited': False,
+                            # Transform → Embedding specific fields
+                            'table_name': table_name,
+                            'external_id': str(external_id)
+                        }
+
+                        # Publish using shared channel
+                        tier = self.queue_manager._get_tenant_tier(tenant_id)
+                        tier_queue = self.queue_manager.get_tier_queue_name(tier, 'embedding')
+
+                        channel.basic_publish(
+                            exchange='',
+                            routing_key=tier_queue,
+                            body=json.dumps(message, cls=DateTimeEncoder),  # Use custom encoder for datetime objects
+                            properties=pika.BasicProperties(
+                                delivery_mode=2,
+                                content_type='application/json'
+                            )
+                        )
+
+                        queued_count += 1
+
+            if queued_count > 0:
+                logger.debug(f"Queued {queued_count} {table_name} entities for embedding using shared channel")
+
+        except Exception as e:
+            logger.error(f"Error queuing entities for embedding: {e}")
+            # Don't raise - embedding is async and shouldn't block transform
+
+    # REMOVED: _queue_all_entities_for_embedding - leftover/dead code, never called
+    # We now queue entities individually using shared channel pattern in _process_jira_project_search
+
+    # REMOVED: _process_jira_issues_changelogs and _process_jira_single_issue
+    # These were leftover/dead code - never called. The actual method used is _process_jira_single_issue_changelog below.
+
+    async def _process_jira_single_issue_changelog(self, raw_data_id: int, tenant_id: int, integration_id: int, job_id: int = None, message: Dict[str, Any] = None) -> bool:
+        """
+        Process Jira issues with changelogs from raw_extraction_data (BATCH MODE).
+
+        NEW BATCH APPROACH:
+        - Processes ONE raw_data record containing up to 100 issues
+        - Transforms all issues in one DB transaction
+        - Sends ONE batch message to embedding with all work_item IDs
+
+        Flow:
+        1. Load raw data containing 100 issues from raw_extraction_data table
+        2. Transform all issues and insert/update work_items table
+        3. Transform all changelogs and insert changelogs table
+        4. Queue ONE batch message to embedding with all work_item IDs
+        """
+        try:
+            # 🎯 HANDLE COMPLETION MESSAGE: raw_data_id=None signals job completion
+            if raw_data_id is None and message and message.get('last_job_item'):
+                logger.debug(f"[COMPLETION] Received completion message for jira_issues_with_changelogs (no data to process)")
+
+                # Send completion message to embedding queue
+                self._queue_entities_for_embedding(
+                    tenant_id=tenant_id,
+                    table_name='work_items',
+                    entities=[],  # Empty list
+                    job_id=job_id,
+                    message_type='jira_issues_with_changelogs',
+                    integration_id=integration_id,
+                    provider=message.get('provider', 'jira'),
+                    last_sync_date=message.get('last_sync_date'),
+                    first_item=True,
+                    last_item=True,
+                    last_job_item=True  # 🎯 Signal job completion to embedding worker
+                )
+
+                logger.debug(f"✅ Sent completion message to embedding queue")
+                return True
+
+            # Extract message flags
+            first_item = message.get('first_item', False) if message else False
+            last_item = message.get('last_item', False) if message else False
+            last_job_item = message.get('last_job_item', False) if message else False
+
+            logger.info(f"📦 [BATCH] Starting issues batch processing (raw_data_id={raw_data_id}, first={first_item}, last={last_item})")
+
+            with self.get_db_session() as db:
+                # Load raw data (batch of issues)
+                raw_data = self._get_raw_data(db, raw_data_id)
+                if not raw_data:
+                    logger.error(f"Raw data {raw_data_id} not found")
+                    return False
+
+                # 🔑 NEW: Raw data contains array of issues under 'issues' key
+                issues = raw_data.get('issues')
+                if not issues:
+                    # Fallback: Try single issue format for backward compatibility
+                    issue = raw_data.get('issue')
+                    if issue:
+                        logger.warning(f"⚠️ Found single issue format (backward compatibility) - wrapping in array")
+                        issues = [issue]
+                    else:
+                        logger.error(f"No 'issues' or 'issue' key found in raw_data_id={raw_data_id}")
+                        return False
+
+                if not isinstance(issues, list):
+                    logger.error(f"'issues' is not a list in raw_data_id={raw_data_id}")
+                    return False
+
+                logger.info(f"📦 [BATCH] Processing {len(issues)} issues from raw_data_id={raw_data_id}")
+
+                # Get reference data for mapping
+                projects_map, wits_map, statuses_map = self._get_reference_data_maps(db, integration_id, tenant_id)
+
+                # Get custom field mappings from integration
+                custom_field_mappings = self._get_custom_field_mappings(db, integration_id, tenant_id)
+
+                # 🔑 Process ALL issues in this batch
+                issues_processed = self._process_issues_data(
+                    db, issues, integration_id, tenant_id, projects_map, wits_map, statuses_map, custom_field_mappings, job_id, message
+                )
+
+                # Process sprint associations for all issues
+                sprint_associations_processed = self._process_sprint_associations(
+                    db, issues, integration_id, tenant_id, custom_field_mappings
+                )
+
+                # Process changelogs for all issues
+                changelogs_processed = self._process_changelogs_data(
+                    db, issues, integration_id, tenant_id, statuses_map, job_id, message
+                )
+
+                # Note: dev_status extraction is now handled by extraction worker, not transform worker
+
+                # Update raw data status to completed
+                from app.core.utils import DateTimeHelper
+                now = DateTimeHelper.now_default()
+
+                update_query = text("""
+                    UPDATE raw_extraction_data
+                    SET status = 'completed',
+                        last_updated_at = :now,
+                        error_details = NULL
+                    WHERE id = :raw_data_id
+                """)
+                db.execute(update_query, {'raw_data_id': raw_data_id, 'now': now})
+                db.commit()
+
+                logger.info(f"📦 [BATCH] Processed {len(issues)} issues, {sprint_associations_processed} sprint associations, {changelogs_processed} changelogs - marked raw_data_id={raw_data_id} as completed")
+
+            # ✅ Send WebSocket status update when last_item=True
+            if last_item and job_id:
+                logger.debug(f"🏁 [ISSUES] Sending 'finished' status for transform step")
+                await self._send_worker_status('transform', tenant_id, job_id, 'finished', 'jira_issues_with_changelogs')
+                logger.debug(f"✅ [ISSUES] Transform step marked as finished and WebSocket notification sent")
+
+            logger.info(f"✅ [BATCH] Completed batch processing (raw_data_id={raw_data_id}, {len(issues)} issues)")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing single jira_single_issue_changelog (raw_data_id={raw_data_id}): {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+
+            # Mark raw data as failed
+            try:
+                from app.core.utils import DateTimeHelper
+                now = DateTimeHelper.now_default()
+
+                with self.get_db_session() as db:
+                    error_query = text("""
+                        UPDATE raw_extraction_data
+                        SET status = 'failed',
+                            error_details = CAST(:error_details AS jsonb),
+                            last_updated_at = :now
+                        WHERE id = :raw_data_id
+                    """)
+                    db.execute(error_query, {
+                        'raw_data_id': raw_data_id,
+                        'error_details': json.dumps({'error': str(e)[:500]}),
+                        'now': now
+                    })
+                    db.commit()
+            except Exception as update_error:
+                logger.error(f"Failed to update raw_data status to failed: {update_error}")
+
+            return False
+
+    def _get_reference_data_maps(self, db, integration_id: int, tenant_id: int):
+        """Get reference data maps for projects, wits, and statuses."""
+        # Get projects map
+        projects_query = text("""
+            SELECT external_id, id, key
+            FROM projects
+            WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+        """)
+        projects_result = db.execute(projects_query, {
+            'integration_id': integration_id,
+            'tenant_id': tenant_id
+        }).fetchall()
+        projects_map = {row[0]: {'id': row[1], 'key': row[2]} for row in projects_result}
+
+        # Get wits map
+        wits_query = text("""
+            SELECT external_id, id
+            FROM wits
+            WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+        """)
+        wits_result = db.execute(wits_query, {
+            'integration_id': integration_id,
+            'tenant_id': tenant_id
+        }).fetchall()
+        wits_map = {row[0]: row[1] for row in wits_result}
+
+        # Get statuses map
+        statuses_query = text("""
+            SELECT external_id, id
+            FROM statuses
+            WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+        """)
+        statuses_result = db.execute(statuses_query, {
+            'integration_id': integration_id,
+            'tenant_id': tenant_id
+        }).fetchall()
+        statuses_map = {row[0]: row[1] for row in statuses_result}
+
+        return projects_map, wits_map, statuses_map
+
+    def _get_custom_field_mappings(self, db, integration_id: int, tenant_id: int) -> Dict[str, str]:
+        """
+        Get custom field mappings from custom_fields_mappings table.
+
+        Returns:
+            Dict mapping Jira field IDs (e.g., 'customfield_10024') to work_items column names or special fields
+            Includes special fields: 'team', 'development', 'story_points'
+
+        Example:
+            {
+                'customfield_10001': 'team',  # Special field
+                'customfield_10000': 'development',  # Special field
+                'customfield_10021': 'sprints',  # Special field
+                'customfield_10024': 'story_points',  # Special field
+                'customfield_10128': 'custom_field_01',  # Regular custom field
+                'customfield_10222': 'custom_field_02',  # Regular custom field
+            }
+        """
+        try:
+            # Get custom field mappings from custom_fields_mappings table
+            query = text("""
+                SELECT
+                    cfm.team_field_id,
+                    cfm.sprints_field_id,
+                    cfm.development_field_id,
+                    cfm.story_points_field_id,
+                    cfm.acceptance_criteria_field_id,
+                    cfm.custom_field_01_id, cfm.custom_field_02_id, cfm.custom_field_03_id,
+                    cfm.custom_field_04_id, cfm.custom_field_05_id, cfm.custom_field_06_id,
+                    cfm.custom_field_07_id, cfm.custom_field_08_id, cfm.custom_field_09_id,
+                    cfm.custom_field_10_id, cfm.custom_field_11_id, cfm.custom_field_12_id,
+                    cfm.custom_field_13_id, cfm.custom_field_14_id, cfm.custom_field_15_id,
+                    cfm.custom_field_16_id, cfm.custom_field_17_id, cfm.custom_field_18_id,
+                    cfm.custom_field_19_id, cfm.custom_field_20_id
+                FROM custom_fields_mappings cfm
+                WHERE cfm.integration_id = :integration_id AND cfm.tenant_id = :tenant_id
+            """)
+            result = db.execute(query, {
+                'integration_id': integration_id,
+                'tenant_id': tenant_id
+            }).fetchone()
+
+            if not result:
+                logger.debug(f"No custom field mappings found for integration {integration_id}")
+                return {}
+
+            # Get custom_fields external_ids for the mapped field IDs
+            field_ids = [fid for fid in result if fid is not None]
+            if not field_ids:
+                logger.debug(f"No custom fields mapped for integration {integration_id}")
+                return {}
+
+            # Query custom_fields to get external_ids
+            fields_query = text("""
+                SELECT id, external_id
+                FROM custom_fields
+                WHERE id = ANY(:field_ids) AND tenant_id = :tenant_id
+            """)
+            fields_result = db.execute(fields_query, {
+                'field_ids': field_ids,
+                'tenant_id': tenant_id
+            }).fetchall()
+
+            # Create map of field_id -> external_id
+            field_id_to_external_id = {row[0]: row[1] for row in fields_result}
+
+            # Build mappings dict
+            mappings = {}
+
+            # Special fields (indices 0, 1, 2, 3, 4)
+            if result[0]:  # team_field_id
+                external_id = field_id_to_external_id.get(result[0])
+                if external_id:
+                    mappings[external_id] = 'team'
+
+            if result[1]:  # sprints_field_id
+                external_id = field_id_to_external_id.get(result[1])
+                if external_id:
+                    mappings[external_id] = 'sprints'  # Used by _process_sprint_associations to find sprint data in issue JSON
+
+            if result[2]:  # development_field_id
+                external_id = field_id_to_external_id.get(result[2])
+                if external_id:
+                    mappings[external_id] = 'development'
+
+            if result[3]:  # story_points_field_id
+                external_id = field_id_to_external_id.get(result[3])
+                if external_id:
+                    mappings[external_id] = 'story_points'
+
+            if result[4]:  # acceptance_criteria_field_id
+                external_id = field_id_to_external_id.get(result[4])
+                if external_id:
+                    mappings[external_id] = 'acceptance_criteria'
+
+            # Regular custom fields (indices 5-24 for custom_field_01 to custom_field_20)
+            for i in range(20):
+                field_id = result[5 + i]  # Start from index 5
+                if field_id:
+                    external_id = field_id_to_external_id.get(field_id)
+                    if external_id:
+                        mappings[external_id] = f'custom_field_{i+1:02d}'
+
+            logger.debug(f"Loaded {len(mappings)} custom field mappings for integration {integration_id}")
+            return mappings
+
+        except Exception as e:
+            logger.error(f"Error loading custom field mappings: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return {}
+
+    def _extract_all_fields(self, fields: Dict, custom_field_mappings: Dict[str, str]) -> Dict:
+        """
+        Extract all mapped fields from Jira issue fields based on mappings.
+        Includes special fields (team, development, story_points) and custom fields.
+
+        Args:
+            fields: Jira issue fields dict
+            custom_field_mappings: Dict mapping Jira field IDs to work_items column names
+                                  e.g., {
+                                      'customfield_10001': 'team',
+                                      'customfield_10000': 'development',
+                                      'customfield_10024': 'story_points',
+                                      'customfield_10128': 'custom_field_01'
+                                  }
+
+        Returns:
+            Dict with all field column names and values
+            e.g., {
+                'team': 'R&I',
+                'development': True,
+                'story_points': 5.0,
+                'custom_field_01': 'Epic Name',
+                'custom_field_02': 'Some value'
+            }
+        """
+        result = {}
+
+        if not custom_field_mappings:
+            # No mappings configured - don't extract any custom fields
+            logger.debug("No custom field mappings configured - skipping custom field extraction")
+            return result
+
+        # Extract mapped fields (special + custom)
+        for jira_field_id, column_name in custom_field_mappings.items():
+            if jira_field_id in fields:
+                value = fields[jira_field_id]
+
+                # Special handling for specific fields
+                if column_name == 'team':
+                    # Team field - extract from dict or string
+                    if value is None:
+                        result[column_name] = None
+                    elif isinstance(value, dict):
+                        result[column_name] = value.get('name') or value.get('value')
+                    elif isinstance(value, str):
+                        result[column_name] = value
+                    else:
+                        result[column_name] = str(value)
+
+                elif column_name == 'development':
+                    # Development field - boolean indicating if there's any development data
+                    # True if field has any content, False otherwise
+                    development = False
+                    if value is not None:
+                        if isinstance(value, bool):
+                            development = value
+                        elif isinstance(value, str):
+                            # Non-empty string (excluding empty JSON objects)
+                            value_stripped = value.strip()
+                            if value_stripped and value_stripped not in ('{}', '[]', '""', "''"):
+                                development = True
+                        elif isinstance(value, dict):
+                            # Non-empty dict
+                            if value:
+                                development = True
+                        elif isinstance(value, list):
+                            # Non-empty list
+                            if value:
+                                development = True
+                        else:
+                            # Any other non-None value
+                            development = True
+                    result[column_name] = development
+
+                elif column_name == 'story_points':
+                    # Story points field - convert to float
+                    story_points = None
+                    if value is not None:
+                        try:
+                            if isinstance(value, (int, float)):
+                                story_points = float(value)
+                            elif isinstance(value, str):
+                                story_points = float(value)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Could not parse story_points value: {value}")
+                            story_points = None
+                    result[column_name] = story_points
+
+                elif column_name == 'acceptance_criteria':
+                    # Acceptance criteria field - extract text content
+                    acceptance_criteria = None
+                    if value is not None:
+                        if isinstance(value, str):
+                            acceptance_criteria = value
+                        elif isinstance(value, dict):
+                            # Handle ADF (Atlassian Document Format) or other structured formats
+                            acceptance_criteria = value.get('content') or str(value)
+                        else:
+                            acceptance_criteria = str(value)
+                    result[column_name] = acceptance_criteria
+
+                elif column_name == 'sprints':
+                    # Sprints field - DO NOT extract as column value
+                    # Sprint data is handled separately by _process_sprint_associations
+                    # which populates the sprints and work_items_sprints tables
+                    # Skip this field to avoid trying to insert into non-existent work_items.sprints column
+                    pass
+
+                else:
+                    # Regular custom field - handle different field types
+                    if value is None:
+                        result[column_name] = None
+                    elif isinstance(value, dict):
+                        # Complex field (e.g., user, option) - extract display value
+                        result[column_name] = value.get('displayName') or value.get('name') or value.get('value') or str(value)
+                    elif isinstance(value, list):
+                        # Array field - join values
+                        if value and isinstance(value[0], dict):
+                            result[column_name] = ', '.join([item.get('name') or item.get('value') or str(item) for item in value])
+                        else:
+                            result[column_name] = ', '.join([str(v) for v in value])
+                    else:
+                        # Simple field (string, number, etc.)
+                        result[column_name] = str(value) if not isinstance(value, str) else value
+
+
+
+        return result
+
+    def _process_issues_data(
+        self, db, issues_data: List[Dict], integration_id: int, tenant_id: int,
+        projects_map: Dict, wits_map: Dict, statuses_map: Dict, custom_field_mappings: Dict[str, str], job_id: int = None, message: Dict[str, Any] = None
+    ) -> int:
+        """
+        Process and insert/update issues in work_items table.
+
+        Args:
+            custom_field_mappings: Dict mapping Jira field IDs to work_items column names
+                                  e.g., {'customfield_10024': 'custom_field_01'}
+        """
+        from app.core.utils import DateTimeHelper
+
+        # Get existing issues
+        external_ids = [issue.get('id') for issue in issues_data if issue.get('id')]
+        existing_issues_query = text("""
+            SELECT external_id, id, key
+            FROM work_items
+            WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+            AND external_id = ANY(:external_ids)
+        """)
+        existing_result = db.execute(existing_issues_query, {
+            'integration_id': integration_id,
+            'tenant_id': tenant_id,
+            'external_ids': external_ids
+        }).fetchall()
+        existing_issues_map = {row[0]: {'id': row[1], 'key': row[2]} for row in existing_result}
+
+        issues_to_insert = []
+        issues_to_update = []
+        current_time = DateTimeHelper.now_default()
+
+        for issue in issues_data:
+            try:
+                external_id = issue.get('id')
+                if not external_id:
+                    continue
+
+                fields = issue.get('fields', {})
+                key = issue.get('key')
+
+                # Extract field values
+                project_external_id = fields.get('project', {}).get('id')
+                wit_external_id = fields.get('issuetype', {}).get('id')
+                status_external_id = fields.get('status', {}).get('id')
+
+                # Map to internal IDs
+                project_id = projects_map.get(project_external_id, {}).get('id') if project_external_id else None
+                wit_id = wits_map.get(wit_external_id) if wit_external_id else None
+                status_id = statuses_map.get(status_external_id) if status_external_id else None
+
+                # Parse dates
+                created = self._parse_datetime(fields.get('created'))
+                updated = self._parse_datetime(fields.get('updated'))
+
+                # Extract other fields
+                summary = fields.get('summary')
+                description = fields.get('description')
+                priority = fields.get('priority', {}).get('name') if fields.get('priority') else None
+                resolution = fields.get('resolution', {}).get('name') if fields.get('resolution') else None
+                assignee = fields.get('assignee', {}).get('displayName') if fields.get('assignee') else None
+                labels = ','.join(fields.get('labels', [])) if fields.get('labels') else None
+                parent_external_id = fields.get('parent', {}).get('id') if fields.get('parent') else None
+
+                # Extract special fields and custom fields based on mappings
+                # This will extract team, development, story_points, and custom_field_01-20
+                all_fields_data = self._extract_all_fields(fields, custom_field_mappings)
+
+                # Extract special fields from the result
+                team = all_fields_data.pop('team', None)
+                # Sprints removed - now using sprints table and work_items_sprints junction table
+                development = all_fields_data.pop('development', False)
+                story_points = all_fields_data.pop('story_points', None)
+                acceptance_criteria = all_fields_data.pop('acceptance_criteria', None)
+
+                # Remaining fields are custom_field_01-20 and overflow
+                custom_fields_data = all_fields_data
+
+                # Check if issue exists
+                if external_id in existing_issues_map:
+                    # Update existing issue
+                    update_dict = {
+                        'id': existing_issues_map[external_id]['id'],
+                        'external_id': external_id,  # Add external_id for embedding queue
+                        'key': existing_issues_map[external_id]['key'],  # Add key for vectorization
+                        'summary': summary,
+                        'description': description,
+                        'project_id': project_id,
+                        'wit_id': wit_id,
+                        'status_id': status_id,
+                        'story_points': story_points,
+                        'priority': priority,
+                        'resolution': resolution,
+                        'assignee': assignee,
+                        'team': team,
+                        'labels': labels,
+                        'updated': updated,
+                        'parent_external_id': parent_external_id,
+                        'development': development,
+                        'acceptance_criteria': acceptance_criteria,
+                        'last_updated_at': current_time
+                    }
+                    # Add custom fields to update dict
+                    update_dict.update(custom_fields_data)
+                    issues_to_update.append(update_dict)
+                else:
+                    # Insert new issue
+                    insert_dict = {
+                        'integration_id': integration_id,
+                        'tenant_id': tenant_id,
+                        'external_id': external_id,
+                        'key': key,
+                        'summary': summary,
+                        'description': description,
+                        'project_id': project_id,
+                        'wit_id': wit_id,
+                        'status_id': status_id,
+                        'story_points': story_points,
+                        'priority': priority,
+                        'resolution': resolution,
+                        'assignee': assignee,
+                        'team': team,
+                        'labels': labels,
+                        'created': created,
+                        'updated': updated,
+                        'parent_external_id': parent_external_id,
+                        'development': development,
+                        'acceptance_criteria': acceptance_criteria,
+                        'active': True,
+                        'created_at': current_time,
+                        'last_updated_at': current_time
+                    }
+                    # Add custom fields to insert dict
+                    insert_dict.update(custom_fields_data)
+                    issues_to_insert.append(insert_dict)
+
+            except Exception as e:
+                logger.error(f"Error processing issue {issue.get('key', 'unknown')}: {e}")
+                continue
+
+        # Get flags from incoming message to forward to embedding
+        first_item = message.get('first_item', False) if message else False
+        last_item = message.get('last_item', False) if message else False
+        last_job_item = message.get('last_job_item', False) if message else False
+        provider = message.get('provider') if message else 'jira'
+        old_last_sync_date = message.get('old_last_sync_date') if message else None  # 🔑 From extraction worker
+        new_last_sync_date = message.get('new_last_sync_date') if message else None
+        token = message.get('token') if message else None  # 🔑 Execution token for job tracking
+
+        # 🚀 Batch issues into groups of 100 for embedding
+        BATCH_SIZE = 100
+        all_issues = issues_to_insert + issues_to_update
+
+        # Bulk insert new issues
+        if issues_to_insert:
+            BulkOperations.bulk_insert(db, 'work_items', issues_to_insert)
+            logger.debug(f"Inserted {len(issues_to_insert)} new issues")
+
+        # Bulk update existing issues
+        if issues_to_update:
+            BulkOperations.bulk_update(db, 'work_items', issues_to_update)
+            logger.debug(f"Updated {len(issues_to_update)} existing issues")
+
+        # Queue all issues for embedding in batches of 100
+        if all_issues:
+            total_batches = (len(all_issues) + BATCH_SIZE - 1) // BATCH_SIZE
+            logger.info(f"📦 [ISSUES] Batching {len(all_issues)} issues into {total_batches} batches of {BATCH_SIZE}")
+
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * BATCH_SIZE
+                end_idx = min(start_idx + BATCH_SIZE, len(all_issues))
+                batch_issues = all_issues[start_idx:end_idx]
+
+                is_first = (batch_idx == 0)
+                is_last = (batch_idx == total_batches - 1)
+
+                logger.info(f"📤 [ISSUES] Queuing batch {batch_idx + 1}/{total_batches}: {len(batch_issues)} issues, first={is_first}, last={is_last}")
+
+                # Queue batch for embedding - only first batch gets first_item=True, only last batch gets last_item=True
+                self._queue_entities_for_embedding(
+                    tenant_id=tenant_id,
+                    table_name='work_items',
+                    entities=batch_issues,
+                    job_id=job_id,
+                    message_type='jira_issues_with_changelogs',
+                    integration_id=integration_id,
+                    provider=provider,
+                    old_last_sync_date=old_last_sync_date,
+                    new_last_sync_date=new_last_sync_date,
+                    first_item=(first_item and is_first),  # Only first batch gets first_item=True
+                    last_item=(last_item and is_last),  # Only last batch gets last_item=True
+                    last_job_item=(last_job_item and is_last),  # Only last batch gets last_job_item=True
+                    token=token
+                )
+
+            logger.info(f"✅ [ISSUES] Queued {len(all_issues)} issues in {total_batches} batches to embedding")
+
+        return len(issues_to_insert) + len(issues_to_update)
+
+    def _process_sprint_associations(
+        self, db, issues_data: List[Dict], integration_id: int, tenant_id: int, custom_field_mappings: Dict[str, str]
+    ) -> int:
+        """
+        Process sprint associations from issues and populate work_items_sprints junction table.
+
+        This extracts sprint data from the sprints field in each issue, creates placeholder
+        sprint records if needed, and creates the many-to-many relationship between work items and sprints.
+
+        Args:
+            db: Database session
+            issues_data: List of issue dictionaries from Jira API
+            integration_id: Integration ID
+            tenant_id: Tenant ID
+            custom_field_mappings: Dict mapping Jira field IDs to column names (includes 'sprints' mapping)
+
+        Returns:
+            Number of sprint associations processed
+        """
+        from app.core.utils import DateTimeHelper
+
+        try:
+            logger.debug(f"🔍 [SPRINT-DEBUG] Starting sprint associations processing for {len(issues_data)} issues")
+
+            # Find the sprint field ID and story points field ID from custom_field_mappings
+            sprint_field_id = None
+            story_points_field_id = None
+            for field_id, field_name in custom_field_mappings.items():
+                if field_name == 'sprints':
+                    sprint_field_id = field_id
+                elif field_name == 'story_points':
+                    story_points_field_id = field_id
+
+            if not sprint_field_id:
+                logger.warning(f"No sprint field mapping found in custom_field_mappings - skipping sprint associations")
+                return 0
+
+            logger.debug(f"Using sprint field: {sprint_field_id}, story points field: {story_points_field_id}")
+
+            # Collect issue external_ids from payload
+            issue_external_ids = [issue.get('id') for issue in issues_data if issue.get('id')]
+            if not issue_external_ids:
+                logger.debug("No valid issue external_ids found in payload")
+                return 0
+
+            # Query ONLY the work_items for the issues in this payload
+            work_items_query = text("""
+                SELECT external_id, id
+                FROM work_items
+                WHERE integration_id = :integration_id
+                AND tenant_id = :tenant_id
+                AND external_id = ANY(:external_ids)
+            """)
+            work_items_result = db.execute(work_items_query, {
+                'integration_id': integration_id,
+                'tenant_id': tenant_id,
+                'external_ids': issue_external_ids
+            }).fetchall()
+            work_items_map = {row[0]: row[1] for row in work_items_result}
+
+            # Collect all unique sprints and their associations
+            sprints_to_create = {}  # {external_id: sprint_data}
+            sprint_associations = []  # [{work_item_external_id, sprint_external_id, ...}]
+            current_time = DateTimeHelper.now_default()
+
+            for issue in issues_data:
+                try:
+                    issue_external_id = issue.get('id')
+                    if not issue_external_id:
+                        continue
+
+                    # Get sprints field from issue using the mapped field ID
+                    fields = issue.get('fields', {})
+                    sprints_field = fields.get(sprint_field_id)
+
+                    logger.debug(f"🔍 [SPRINT-DEBUG] Issue {issue.get('key')}: sprints_field type={type(sprints_field)}, value={sprints_field}")
+
+                    if not sprints_field or not isinstance(sprints_field, list):
+                        continue
+
+                    # Extract sprint sequence from changelog (for carry-over tracking)
+                    sprint_sequence = self._extract_sprint_sequence_from_changelog(issue, sprint_field_id)
+
+                    # Create a map of sprint_id -> position in sequence for carry-over tracking
+                    sprint_sequence_map = {sprint_id: idx for idx, sprint_id in enumerate(sprint_sequence)}
+
+                    # Extract sprint data from sprints array
+                    for sprint in sprints_field:
+                        if isinstance(sprint, dict):
+                            sprint_external_id = str(sprint.get('id'))  # Sprint ID
+                            board_id = sprint.get('boardId')
+                            sprint_name = sprint.get('name')
+                            sprint_state = sprint.get('state')  # future, active, closed
+                            sprint_goal = sprint.get('goal')
+                            start_date = sprint.get('startDate')
+                            end_date = sprint.get('endDate')
+                            complete_date = sprint.get('completeDate')
+
+                            if sprint_external_id:
+                                # Collect unique sprint data
+                                if sprint_external_id not in sprints_to_create:
+                                    sprints_to_create[sprint_external_id] = {
+                                        'external_id': sprint_external_id,
+                                        'board_id': board_id,
+                                        'name': sprint_name,
+                                        'state': sprint_state,
+                                        'goal': sprint_goal,
+                                        'start_date': start_date,
+                                        'end_date': end_date,
+                                        'complete_date': complete_date
+                                    }
+
+                                # Calculate changelog-based added_date and removed_date
+                                added_date, removed_date = self._calculate_sprint_dates_from_issue_changelog(
+                                    issue, sprint_external_id, sprint_field_id
+                                )
+
+                                # Calculate estimate_at_start using sprint start date
+                                estimate_at_start = None
+                                if start_date and story_points_field_id:
+                                    estimate_at_start = self._calculate_estimate_at_start(
+                                        issue, start_date, story_points_field_id
+                                    )
+
+                                # Fallback for added_date: use sprint start_date if no changelog found
+                                if not added_date and start_date:
+                                    added_date = self._parse_datetime(start_date)
+
+                                # Fallback for added_date: use current_time if still None
+                                if not added_date:
+                                    added_date = current_time
+
+                                # Determine carry-over sprints based on sequence
+                                carried_over_from_sprint_id = None
+                                carried_over_to_sprint_id = None
+
+                                if sprint_sequence and sprint_external_id in sprint_sequence_map:
+                                    idx = sprint_sequence_map[sprint_external_id]
+                                    # Previous sprint in sequence
+                                    if idx > 0:
+                                        carried_over_from_sprint_id = sprint_sequence[idx - 1]
+                                    # Next sprint in sequence
+                                    if idx < len(sprint_sequence) - 1:
+                                        carried_over_to_sprint_id = sprint_sequence[idx + 1]
+
+                                # Collect association with calculated dates, estimate, and carry-over tracking
+                                sprint_associations.append({
+                                    'work_item_external_id': issue_external_id,
+                                    'sprint_external_id': sprint_external_id,
+                                    'tenant_id': tenant_id,
+                                    'added_date': added_date,
+                                    'removed_date': removed_date,
+                                    'estimate_at_start': estimate_at_start,
+                                    'carried_over_from_sprint_external_id': carried_over_from_sprint_id,
+                                    'carried_over_to_sprint_external_id': carried_over_to_sprint_id
+                                })
+
+                except Exception as e:
+                    logger.error(f"Error processing sprint associations for issue {issue.get('key', 'unknown')}: {e}")
+                    continue
+
+            if not sprint_associations:
+                logger.info(f"📊 No sprint associations found in {len(issues_data)} issues")
+                return 0
+
+            logger.info(f"📊 Found {len(sprint_associations)} sprint associations from {len(issues_data)} issues")
+            logger.info(f"📊 Found {len(sprints_to_create)} unique sprints to create/update")
+
+            # Step 1: Get existing sprints
+            existing_sprints_query = text("""
+                SELECT external_id, id
+                FROM sprints
+                WHERE tenant_id = :tenant_id
+                AND external_id = ANY(:external_ids)
+            """)
+            existing_sprints_result = db.execute(existing_sprints_query, {
+                'tenant_id': tenant_id,
+                'external_ids': list(sprints_to_create.keys())
+            }).fetchall()
+            existing_sprints_map = {row[0]: row[1] for row in existing_sprints_result}
+
+            # Step 2: Upsert sprint records (insert new + update existing)
+            # Use PostgreSQL ON CONFLICT to handle concurrent inserts gracefully
+            sprints_to_upsert = []
+            for sprint_external_id, sprint_data in sprints_to_create.items():
+                sprints_to_upsert.append({
+                    'tenant_id': tenant_id,
+                    'integration_id': integration_id,
+                    'external_id': sprint_external_id,
+                    'board_id': sprint_data['board_id'],
+                    'name': sprint_data['name'],
+                    'state': sprint_data['state'],
+                    'goal': sprint_data.get('goal'),
+                    'start_date': sprint_data.get('start_date'),
+                    'end_date': sprint_data.get('end_date'),
+                    'complete_date': sprint_data.get('complete_date'),
+                    'active': True,
+                    'created_at': current_time,
+                    'last_updated_at': current_time
+                })
+
+            if sprints_to_upsert:
+                # Use ON CONFLICT DO UPDATE to handle race conditions between concurrent workers
+                upsert_query = text("""
+                    INSERT INTO sprints (tenant_id, integration_id, external_id, board_id, name, state, goal, start_date, end_date, complete_date, active, created_at, last_updated_at)
+                    VALUES (:tenant_id, :integration_id, :external_id, :board_id, :name, :state, :goal, :start_date, :end_date, :complete_date, :active, :created_at, :last_updated_at)
+                    ON CONFLICT (tenant_id, integration_id, external_id)
+                    DO UPDATE SET
+                        board_id = EXCLUDED.board_id,
+                        name = EXCLUDED.name,
+                        state = EXCLUDED.state,
+                        goal = EXCLUDED.goal,
+                        start_date = EXCLUDED.start_date,
+                        end_date = EXCLUDED.end_date,
+                        complete_date = EXCLUDED.complete_date,
+                        last_updated_at = EXCLUDED.last_updated_at
+                """)
+
+                for sprint in sprints_to_upsert:
+                    db.execute(upsert_query, sprint)
+
+                logger.info(f"✅ Upserted {len(sprints_to_upsert)} sprint records")
+
+            # Refresh sprints map after upsert
+            existing_sprints_result = db.execute(existing_sprints_query, {
+                'tenant_id': tenant_id,
+                'external_ids': list(sprints_to_create.keys())
+            }).fetchall()
+            existing_sprints_map = {row[0]: row[1] for row in existing_sprints_result}
+
+            # Step 3: Create work_items_sprints associations with changelog-based dates, estimate_at_start, and carry-over tracking
+            # Map work_item external_ids to internal_ids
+            associations_to_insert = []
+            for assoc in sprint_associations:
+                work_item_external_id = assoc['work_item_external_id']
+                sprint_external_id = assoc['sprint_external_id']
+
+                work_item_id = work_items_map.get(work_item_external_id)
+                sprint_id = existing_sprints_map.get(sprint_external_id)
+
+                if work_item_id and sprint_id:
+                    # Map carry-over sprint external IDs to internal IDs
+                    carried_over_from_sprint_id = None
+                    carried_over_to_sprint_id = None
+
+                    if assoc.get('carried_over_from_sprint_external_id'):
+                        carried_over_from_sprint_id = existing_sprints_map.get(
+                            assoc['carried_over_from_sprint_external_id']
+                        )
+
+                    if assoc.get('carried_over_to_sprint_external_id'):
+                        carried_over_to_sprint_id = existing_sprints_map.get(
+                            assoc['carried_over_to_sprint_external_id']
+                        )
+
+                    associations_to_insert.append({
+                        'work_item_id': work_item_id,
+                        'sprint_id': sprint_id,
+                        'added_date': assoc['added_date'],  # Changelog-based or fallback
+                        'removed_date': assoc.get('removed_date'),  # Changelog-based or None
+                        'estimate_at_start': assoc.get('estimate_at_start'),  # Calculated from changelog
+                        'carried_over_from_sprint_id': carried_over_from_sprint_id,  # Previous sprint in sequence
+                        'carried_over_to_sprint_id': carried_over_to_sprint_id,  # Next sprint in sequence
+                        'tenant_id': assoc['tenant_id'],
+                        'active': True,
+                        'created_at': current_time,
+                        'last_updated_at': current_time
+                    })
+
+            if associations_to_insert:
+                # Use ON CONFLICT DO NOTHING to handle race conditions between concurrent workers
+                # The unique constraint is on (work_item_id, sprint_id, added_date)
+                upsert_assoc_query = text("""
+                    INSERT INTO work_items_sprints
+                        (work_item_id, sprint_id, added_date, removed_date, estimate_at_start,
+                         carried_over_from_sprint_id, carried_over_to_sprint_id,
+                         tenant_id, active, created_at, last_updated_at)
+                    VALUES
+                        (:work_item_id, :sprint_id, :added_date, :removed_date, :estimate_at_start,
+                         :carried_over_from_sprint_id, :carried_over_to_sprint_id,
+                         :tenant_id, :active, :created_at, :last_updated_at)
+                    ON CONFLICT (work_item_id, sprint_id, added_date)
+                    DO NOTHING
+                """)
+
+                inserted_count = 0
+                for assoc in associations_to_insert:
+                    result = db.execute(upsert_assoc_query, assoc)
+                    # rowcount will be 1 if inserted, 0 if conflict (already exists)
+                    inserted_count += result.rowcount
+
+                if inserted_count > 0:
+                    logger.info(f"✅ Created {inserted_count} new work_items_sprints associations with changelog-based dates and estimates (skipped {len(associations_to_insert) - inserted_count} duplicates)")
+                else:
+                    logger.debug(f"All {len(associations_to_insert)} sprint associations already exist")
+
+            # NOTE: We do NOT queue sprints for embedding here in Step 3
+            # Sprints will be queued for embedding in Step 5 (sprint_reports) after metrics are added
+            # This avoids embedding incomplete sprint data and prevents duplicate embeddings
+
+            return len(sprint_associations)
+
+        except Exception as e:
+            logger.error(f"Error processing sprint associations: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return 0
+
+    def _process_changelogs_data(
+        self, db, issues_data: List[Dict], integration_id: int, tenant_id: int,
+        statuses_map: Dict, job_id: int = None, message: Dict[str, Any] = None
+    ) -> int:
+        """Process and insert changelogs from issues data."""
+        from datetime import timezone
+        from app.core.utils import DateTimeHelper
+
+        # Get work_items map for changelog linking
+        work_items_query = text("""
+            SELECT external_id, id, key, created
+            FROM work_items
+            WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+        """)
+        work_items_result = db.execute(work_items_query, {
+            'integration_id': integration_id,
+            'tenant_id': tenant_id
+        }).fetchall()
+        work_items_map = {row[2]: {'id': row[1], 'external_id': row[0], 'created': row[3]} for row in work_items_result}
+
+        # Get existing changelogs to avoid duplicates
+        existing_changelogs_query = text("""
+            SELECT work_item_id, external_id
+            FROM changelogs
+            WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+        """)
+        existing_result = db.execute(existing_changelogs_query, {
+            'integration_id': integration_id,
+            'tenant_id': tenant_id
+        }).fetchall()
+        existing_changelogs = {(row[0], row[1]) for row in existing_result}
+
+        changelogs_to_insert = []
+        current_time = DateTimeHelper.now_default()
+
+        for issue in issues_data:
+            try:
+                issue_key = issue.get('key')
+                if not issue_key or issue_key not in work_items_map:
+                    continue
+
+                work_item_id = work_items_map[issue_key]['id']
+                work_item_created = work_items_map[issue_key]['created']
+
+                # Get changelog from issue
+                changelog = issue.get('changelog', {})
+                histories = changelog.get('histories', [])
+
+                if not histories:
+                    continue
+
+                # Sort changelogs by created date
+                sorted_histories = sorted(histories, key=lambda x: x.get('created', ''))
+
+                # Process each changelog entry
+                for i, history in enumerate(sorted_histories):
+                    try:
+                        changelog_external_id = history.get('id')
+                        if not changelog_external_id:
+                            continue
+
+                        # Skip if already exists
+                        if (work_item_id, changelog_external_id) in existing_changelogs:
+                            continue
+
+                        # Look for status changes in items
+                        items = history.get('items', [])
+                        status_change = None
+                        for item in items:
+                            if item.get('field') == 'status':
+                                status_change = item
+                                break
+
+                        if not status_change:
+                            # Not a status change, skip
+                            continue
+
+                        # Extract status transition
+                        from_status_external_id = status_change.get('from')
+                        to_status_external_id = status_change.get('to')
+
+                        from_status_id = statuses_map.get(from_status_external_id) if from_status_external_id else None
+                        to_status_id = statuses_map.get(to_status_external_id) if to_status_external_id else None
+
+                        # Parse transition date
+                        transition_change_date = self._parse_datetime(history.get('created'))
+
+                        # Calculate transition_start_date
+                        if i == 0:
+                            # First transition starts from issue creation
+                            transition_start_date = work_item_created
+                            # Ensure timezone-aware for comparison
+                            if transition_start_date and transition_start_date.tzinfo is None:
+                                transition_start_date = transition_start_date.replace(tzinfo=timezone.utc)
+                        else:
+                            # Subsequent transitions start from previous transition date
+                            prev_history = sorted_histories[i-1]
+                            transition_start_date = self._parse_datetime(prev_history.get('created'))
+
+                        # Calculate time in status (seconds)
+                        time_in_status_seconds = None
+                        if transition_start_date and transition_change_date:
+                            # Ensure both are timezone-aware for subtraction
+                            if transition_start_date.tzinfo is None:
+                                transition_start_date = transition_start_date.replace(tzinfo=timezone.utc)
+                            if transition_change_date.tzinfo is None:
+                                transition_change_date = transition_change_date.replace(tzinfo=timezone.utc)
+
+                            time_diff = transition_change_date - transition_start_date
+                            time_in_status_seconds = time_diff.total_seconds()
+
+                        # Extract author
+                        author_data = history.get('author', {})
+                        changed_by = author_data.get('displayName') if author_data else None
+
+                        changelogs_to_insert.append({
+                            'integration_id': integration_id,
+                            'tenant_id': tenant_id,
+                            'work_item_id': work_item_id,
+                            'external_id': changelog_external_id,
+                            'from_status_id': from_status_id,
+                            'to_status_id': to_status_id,
+                            'transition_start_date': transition_start_date,
+                            'transition_change_date': transition_change_date,
+                            'time_in_status_seconds': time_in_status_seconds,
+                            'changed_by': changed_by,
+                            'active': True,
+                            'created_at': current_time,
+                            'last_updated_at': current_time
+                        })
+
+                    except Exception as e:
+                        logger.error(f"Error processing changelog {history.get('id', 'unknown')}: {e}")
+                        continue
+
+            except Exception as e:
+                logger.error(f"Error processing changelogs for issue {issue.get('key', 'unknown')}: {e}")
+                continue
+
+        # Bulk insert changelogs
+        if changelogs_to_insert:
+            BulkOperations.bulk_insert(db, 'changelogs', changelogs_to_insert)
+            logger.debug(f"Inserted {len(changelogs_to_insert)} new changelogs")
+
+            # Get flags from incoming message to forward to embedding
+            first_item = message.get('first_item', False) if message else False
+            last_item = message.get('last_item', False) if message else False
+            last_job_item = message.get('last_job_item', False) if message else False
+            provider = message.get('provider') if message else 'jira'
+            old_last_sync_date = message.get('old_last_sync_date') if message else None  # 🔑 From extraction worker
+            new_last_sync_date = message.get('new_last_sync_date') if message else None
+
+            # 🔑 CHUNK CHANGELOGS: 100 issues can have 1000+ changelogs
+            # Send changelogs in batches of 100 to avoid overwhelming embedding worker
+            CHANGELOG_BATCH_SIZE = 100
+            total_changelogs = len(changelogs_to_insert)
+            num_batches = (total_changelogs + CHANGELOG_BATCH_SIZE - 1) // CHANGELOG_BATCH_SIZE
+
+            logger.info(f"📦 [CHANGELOG-CHUNKING] Splitting {total_changelogs} changelogs into {num_batches} batches of {CHANGELOG_BATCH_SIZE}")
+
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * CHANGELOG_BATCH_SIZE
+                end_idx = min(start_idx + CHANGELOG_BATCH_SIZE, total_changelogs)
+                changelog_batch = changelogs_to_insert[start_idx:end_idx]
+
+                # Calculate flags for this changelog batch
+                # first_item: True only for the first changelog batch AND if incoming message has first_item=True
+                # last_item: True only for the last changelog batch AND if incoming message has last_item=True
+                # last_job_item: True only for the last changelog batch AND if incoming message has last_job_item=True
+                batch_first_item = first_item and (batch_idx == 0)
+                batch_last_item = last_item and (batch_idx == num_batches - 1)
+                batch_last_job_item = last_job_item and (batch_idx == num_batches - 1)
+
+                logger.debug(f"📦 [CHANGELOG-BATCH {batch_idx+1}/{num_batches}] Queuing {len(changelog_batch)} changelogs (first={batch_first_item}, last={batch_last_item}, last_job={batch_last_job_item})")
+
+                # Queue this batch for embedding
+                self._queue_entities_for_embedding(tenant_id, 'changelogs', changelog_batch, job_id,
+                                                 message_type='jira_issues_with_changelogs', integration_id=integration_id,
+                                                 provider=provider, old_last_sync_date=old_last_sync_date,
+                                                 new_last_sync_date=new_last_sync_date,
+                                                 first_item=batch_first_item, last_item=batch_last_item, last_job_item=batch_last_job_item)
+
+        # Calculate and update enhanced workflow metrics from in-memory changelog data
+        if changelogs_to_insert:
+            logger.debug(f"Calculating enhanced workflow metrics for {len(work_items_map)} work items...")
+            self._calculate_and_update_workflow_metrics(
+                db, changelogs_to_insert, work_items_map, statuses_map, integration_id, tenant_id
+            )
+
+        return len(changelogs_to_insert)
+
+    def _calculate_and_update_workflow_metrics(
+        self, db, changelogs_data: List[Dict], work_items_map: Dict,
+        statuses_map: Dict, integration_id: int, tenant_id: int
+    ):
+        """
+        Calculate enhanced workflow metrics from in-memory changelog data and bulk update work_items.
+
+        Args:
+            changelogs_data: List of changelog dicts (from changelogs_to_insert)
+            work_items_map: Dict mapping work_item keys to {id, external_id, created}
+            statuses_map: Dict mapping status external_ids to status internal IDs
+        """
+        from datetime import datetime, timezone
+        from app.core.utils import DateTimeHelper
+
+        # Group changelogs by work_item_id
+        changelogs_by_work_item = {}
+        for changelog in changelogs_data:
+            work_item_id = changelog['work_item_id']
+            if work_item_id not in changelogs_by_work_item:
+                changelogs_by_work_item[work_item_id] = []
+            changelogs_by_work_item[work_item_id].append(changelog)
+
+        # Get status categories map (status_id -> category)
+        status_categories = {}
+        reverse_statuses_map = {v: k for k, v in statuses_map.items()}  # internal_id -> external_id
+
+        statuses_query = text("""
+            SELECT id, external_id, original_category
+            FROM statuses
+            WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+        """)
+        statuses_result = db.execute(statuses_query, {
+            'integration_id': integration_id,
+            'tenant_id': tenant_id
+        }).fetchall()
+        status_categories = {row[0]: row[2].lower() if row[2] else None for row in statuses_result}
+
+        # Calculate metrics for each work item
+        work_items_to_update = []
+        current_time = DateTimeHelper.now_default()
+
+        for work_item_id, changelogs in changelogs_by_work_item.items():
+            # Sort changelogs by transition_change_date DESC (newest first)
+            sorted_changelogs = sorted(
+                changelogs,
+                key=lambda x: x['transition_change_date'] if x['transition_change_date'] else datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True
+            )
+
+            # Calculate metrics
+            metrics = self._calculate_enhanced_workflow_metrics(
+                sorted_changelogs, status_categories
+            )
+
+            # Add to update list
+            work_items_to_update.append({
+                'id': work_item_id,
+                'work_first_committed_at': metrics['work_first_committed_at'],
+                'work_first_started_at': metrics['work_first_started_at'],
+                'work_last_started_at': metrics['work_last_started_at'],
+                'work_first_completed_at': metrics['work_first_completed_at'],
+                'work_last_completed_at': metrics['work_last_completed_at'],
+                'total_work_starts': metrics['total_work_starts'],
+                'total_completions': metrics['total_completions'],
+                'total_backlog_returns': metrics['total_backlog_returns'],
+                'total_work_time_seconds': metrics['total_work_time_seconds'],
+                'total_review_time_seconds': metrics['total_review_time_seconds'],
+                'total_cycle_time_seconds': metrics['total_cycle_time_seconds'],
+                'total_lead_time_seconds': metrics['total_lead_time_seconds'],
+                'workflow_complexity_score': metrics['workflow_complexity_score'],
+                'rework_indicator': metrics['rework_indicator'],
+                'direct_completion': metrics['direct_completion'],
+                'last_updated_at': current_time
+            })
+
+        # Bulk update work_items
+        if work_items_to_update:
+            BulkOperations.bulk_update(db, 'work_items', work_items_to_update)
+            logger.debug(f"Updated workflow metrics for {len(work_items_to_update)} work items")
+
+    def _calculate_enhanced_workflow_metrics(
+        self, changelogs: List[Dict], status_categories: Dict[int, str]
+    ) -> Dict[str, any]:
+        """
+        Calculate comprehensive workflow metrics from changelog data.
+
+        Args:
+            changelogs: List of changelog dicts (sorted by transition_change_date DESC)
+            status_categories: Dict mapping status_id to category ('to do', 'in progress', 'done')
+
+        Returns:
+            Dictionary containing all enhanced workflow metrics
+        """
+        from app.core.utils import DateTimeHelper
+
+        if not changelogs:
+            return {
+                'work_first_committed_at': None,
+                'work_first_started_at': None,
+                'work_last_started_at': None,
+                'work_first_completed_at': None,
+                'work_last_completed_at': None,
+                'total_work_starts': 0,
+                'total_completions': 0,
+                'total_backlog_returns': 0,
+                'total_work_time_seconds': 0.0,
+                'total_review_time_seconds': 0.0,
+                'total_cycle_time_seconds': 0.0,
+                'total_lead_time_seconds': 0.0,
+                'workflow_complexity_score': 0,
+                'rework_indicator': False,
+                'direct_completion': False
+            }
+
+        metrics = {
+            'work_first_committed_at': None,
+            'work_first_started_at': None,
+            'work_last_started_at': None,
+            'work_first_completed_at': None,
+            'work_last_completed_at': None,
+            'total_work_starts': 0,
+            'total_completions': 0,
+            'total_backlog_returns': 0,
+            'total_work_time_seconds': 0.0,
+            'total_review_time_seconds': 0.0,
+            'total_cycle_time_seconds': 0.0,
+            'total_lead_time_seconds': 0.0,
+            'workflow_complexity_score': 0,
+            'rework_indicator': False,
+            'direct_completion': False
+        }
+
+        # Track time spent in each category
+        time_tracking = {}
+
+        # Process changelogs (already sorted DESC - newest first)
+        for changelog in changelogs:
+            transition_date = changelog.get('transition_change_date')
+            to_status_id = changelog.get('to_status_id')
+            time_in_status = changelog.get('time_in_status_seconds', 0.0) or 0.0
+
+            if not transition_date or not to_status_id:
+                continue
+
+            to_category = status_categories.get(to_status_id)
+
+            # Accumulate time in each category
+            if to_category and time_in_status:
+                time_tracking[to_category] = time_tracking.get(to_category, 0.0) + time_in_status
+
+            # Count transitions and track timing milestones
+            if to_category:
+                # Commitment tracking (TO 'To Do' statuses)
+                if to_category == 'to do':
+                    metrics['total_backlog_returns'] += 1
+                    # First commitment = oldest (always update, will be last in DESC order)
+                    metrics['work_first_committed_at'] = transition_date
+
+                # Work starts (TO 'In Progress')
+                if to_category == 'in progress':
+                    metrics['total_work_starts'] += 1
+                    # Last work start = newest (first in DESC order) - only set once
+                    if not metrics['work_last_started_at']:
+                        metrics['work_last_started_at'] = transition_date
+                    # First work start = oldest (always update, will be last in DESC order)
+                    metrics['work_first_started_at'] = transition_date
+
+                # Completions (TO 'Done')
+                if to_category == 'done':
+                    metrics['total_completions'] += 1
+                    # Last completion = newest (first in DESC order) - only set once
+                    if not metrics['work_last_completed_at']:
+                        metrics['work_last_completed_at'] = transition_date
+                    # First completion = oldest (always update, will be last in DESC order)
+                    metrics['work_first_completed_at'] = transition_date
+
+        # Aggregate time metrics
+        metrics['total_work_time_seconds'] = time_tracking.get('in progress', 0.0)
+        metrics['total_review_time_seconds'] = time_tracking.get('to do', 0.0)
+
+        # Calculate cycle time (first start to last completion)
+        if metrics['work_first_started_at'] and metrics['work_last_completed_at']:
+            metrics['total_cycle_time_seconds'] = DateTimeHelper.calculate_time_difference_seconds_float(
+                metrics['work_first_started_at'], metrics['work_last_completed_at']
+            ) or 0.0
+
+        # Calculate lead time (first commitment to last completion)
+        if metrics['work_first_committed_at'] and metrics['work_last_completed_at']:
+            metrics['total_lead_time_seconds'] = DateTimeHelper.calculate_time_difference_seconds_float(
+                metrics['work_first_committed_at'], metrics['work_last_completed_at']
+            ) or 0.0
+
+        # Calculate pattern metrics
+        metrics['workflow_complexity_score'] = (
+            (metrics['total_backlog_returns'] * 2) +
+            max(0, metrics['total_completions'] - 1)
+        )
+
+        metrics['rework_indicator'] = metrics['total_work_starts'] > 1
+
+        # Calculate direct completion (went straight from creation to done without intermediate steps)
+        metrics['direct_completion'] = (
+            len(changelogs) == 1 and
+            metrics['total_completions'] == 1 and
+            metrics['total_work_starts'] == 0
+        )
+
+        return metrics
+
+    async def _process_jira_dev_status(self, raw_data_id: int, tenant_id: int, integration_id: int, job_id: int = None, message: Dict[str, Any] = None) -> bool:
+        """
+        Process Jira dev_status data from raw_extraction_data.
+
+        Flow:
+        1. Load raw data from raw_extraction_data table
+        2. Extract PR links from dev_status
+        3. Bulk insert/update work_items_prs_links table
+        4. Queue for vectorization
+        """
+        try:
+
+
+            # 🎯 DEBUG: Log message flags for dev_status processing
+            first_item = message.get('first_item', False) if message else False
+            last_item = message.get('last_item', False) if message else False
+            last_job_item = message.get('last_job_item', False) if message else False
+
+            logger.debug(f"🏁 [DEV_STATUS] Starting dev status processing (raw_data_id={raw_data_id}, first={first_item}, last={last_item})")
+            # NOTE: Status updates are handled by TransformWorker router (lines 138-148, 276-283)
+
+            with self.get_db_session() as db:
+                # Load raw data
+                raw_data = self._get_raw_data(db, raw_data_id)
+                if not raw_data:
+                    logger.error(f"Raw data {raw_data_id} not found")
+                    # NOTE: "finished" status is sent by TransformWorker router (line 276-283)
+                    return False
+
+                # 🔑 NEW: Check for batch format first
+                dev_status_batch = raw_data.get('dev_status_batch')
+
+                if dev_status_batch:
+                    # 🔑 NEW: Batch mode - process array of dev_status objects
+                    logger.info(f"📦 [DEV-STATUS-BATCH] Processing batch of {len(dev_status_batch)} dev_status")
+
+                    # Convert batch format to list format expected by _process_dev_status_data
+                    dev_status_data = []
+                    for dev_status_item in dev_status_batch:
+                        dev_status_data.append({
+                            'issue_key': dev_status_item.get('issue_key'),
+                            'issue_id': dev_status_item.get('issue_id'),
+                            'dev_details': dev_status_item.get('dev_status', {})
+                        })
+
+                    logger.debug(f"📦 [DEV-STATUS-BATCH] Processing dev_status for {len(dev_status_data)} issues")
+
+                else:
+                    # OLD: Single issue format (backward compatibility)
+                    logger.debug(f"⚠️ [DEV-STATUS] Processing single dev_status (old format)")
+
+                    # Extract dev_status data - handle single issue format from extraction worker
+                    issue_key = raw_data.get('issue_key')
+                    issue_id = raw_data.get('issue_id')
+                    dev_status = raw_data.get('dev_status')
+
+                    if not dev_status or not issue_key:
+                        logger.warning(f"No dev_status or issue_key found in raw_data_id={raw_data_id}")
+                        # ✅ Send transform worker "finished" status when last_item=True even if no data
+                        if message and message.get('last_item') and job_id:
+                            logger.debug(f"🏁 [DEV_STATUS] Sending 'finished' status for transform step (no data)")
+                            await self._send_worker_status("transform", tenant_id, job_id, "finished", "jira_dev_status")
+                            logger.debug(f"✅ [DEV_STATUS] Transform step marked as finished (no data)")
+                        return True
+
+                    # Convert to list format expected by _process_dev_status_data
+                    dev_status_data = [{
+                        'issue_key': issue_key,
+                        'issue_id': issue_id,
+                        'dev_details': dev_status
+                    }]
+
+                # Process dev_status (works for both batch and single)
+                pr_links_processed = await self._process_dev_status_data(
+                    db, dev_status_data, integration_id, tenant_id, job_id, message
+                )
+
+                # Update raw data status to completed
+                from sqlalchemy import text
+                from app.core.utils import DateTimeHelper
+                now = DateTimeHelper.now_default()
+
+                update_query = text("""
+                    UPDATE raw_extraction_data
+                    SET status = 'completed',
+                        last_updated_at = :now,
+                        error_details = NULL
+                    WHERE id = :raw_data_id
+                """)
+                db.execute(update_query, {'raw_data_id': raw_data_id, 'now': now})
+                db.commit()
+
+                logger.debug(f"Processed {pr_links_processed} PR links from dev_status - marked raw_data_id={raw_data_id} as completed")
+
+                # Note: WebSocket "finished" status is sent by _process_dev_status_data when last_item=True
+
+                logger.debug(f"✅ [DEV_STATUS] Completed dev status processing (raw_data_id={raw_data_id})")
+                return True
+
+        except Exception as e:
+            logger.error(f"Error processing jira_dev_status: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+
+            # Mark as failed
+            try:
+                with self.get_db_session() as db:
+                    from sqlalchemy import text
+                    from app.core.utils import DateTimeHelper
+                    now = DateTimeHelper.now_default()
+
+                    update_query = text("""
+                        UPDATE raw_extraction_data
+                        SET status = 'failed',
+                            last_updated_at = :now,
+                            error_details = CAST(:error_details AS jsonb)
+                        WHERE id = :raw_data_id
+                    """)
+                    import json
+                    db.execute(update_query, {
+                        'raw_data_id': raw_data_id,
+                        'error_details': json.dumps({'error': str(e), 'traceback': traceback.format_exc()}),
+                        'now': now
+                    })
+                    db.commit()
+            except Exception as update_error:
+                logger.error(f"Failed to mark raw_data as failed: {update_error}")
+
+            # NOTE: "failed" status would be sent by TransformWorker router if needed
+            # For now, just return False to indicate failure
+
+            return False
+
+    def _extract_sprint_sequence_from_changelog(
+        self, issue: Dict, sprint_field_id: str
+    ) -> List[str]:
+        """
+        Extract the complete sprint sequence from the FIRST (newest) changelog entry.
+
+        The first changelog entry for the Sprint field contains the complete history
+        in the 'to' value (e.g., "101, 102, 103, 104").
+
+        Args:
+            issue: Full issue dict from Jira API (contains changelog.histories)
+            sprint_field_id: Sprint field ID from custom_field_mappings (e.g., 'customfield_10021')
+
+        Returns:
+            List of sprint IDs in chronological order (oldest to newest)
+        """
+        try:
+            changelog = issue.get('changelog', {})
+            histories = changelog.get('histories', [])
+
+            if not histories:
+                return []
+
+            # Find the FIRST (newest) changelog entry for Sprint field
+            for history in histories:
+                items = history.get('items', [])
+                for item in items:
+                    if item.get('field') == 'Sprint' and item.get('fieldId') == sprint_field_id:
+                        to_value = item.get('to', '')
+                        if to_value:
+                            # Parse sprint IDs from comma-separated string
+                            sprint_ids = [sid.strip() for sid in to_value.split(',') if sid.strip()]
+                            return sprint_ids
+
+            return []
+
+        except Exception as e:
+            logger.error(f"Error extracting sprint sequence from changelog: {e}")
+            return []
+
+    def _calculate_sprint_dates_from_issue_changelog(
+        self, issue: Dict, sprint_id: str, sprint_field_id: str
+    ) -> tuple[Optional[str], Optional[str]]:
+        """
+        Calculate precise added_date and removed_date for a sprint from issue's changelog JSON.
+
+        Algorithm (Simple Approach - Last Added / Last Removed):
+        1. Parse changelog histories from issue JSON
+        2. Find all ADD events: sprint_id appears in 'to' but not in 'from'
+        3. Find all REMOVE events: sprint_id appears in 'from' but not in 'to'
+        4. Use LAST add event as added_date
+        5. Use LAST remove event (only if after last add) as removed_date
+
+        Args:
+            issue: Full issue dict from Jira API (contains changelog.histories)
+            sprint_id: Sprint external_id to track (as string)
+            sprint_field_id: Sprint field ID from custom_field_mappings (e.g., 'customfield_10021')
+
+        Returns:
+            tuple: (added_date, removed_date) - both can be None if not found in changelog
+        """
+        try:
+            changelog = issue.get('changelog', {})
+            histories = changelog.get('histories', [])
+
+            if not histories:
+                return (None, None)
+
+            add_events = []
+            remove_events = []
+
+            # Process each changelog history entry
+            for history in histories:
+                created = history.get('created')
+                if not created:
+                    continue
+
+                items = history.get('items', [])
+                for item in items:
+                    # Only process Sprint field changes
+                    if item.get('field') == 'Sprint' and item.get('fieldId') == sprint_field_id:
+                        from_value = item.get('from', '')
+                        to_value = item.get('to', '')
+
+                        # Parse sprint IDs from comma-separated strings
+                        from_sprints = set(from_value.split(', ')) if from_value else set()
+                        to_sprints = set(to_value.split(', ')) if to_value else set()
+
+                        # Detect ADD event: sprint_id in 'to' but not in 'from'
+                        if sprint_id in to_sprints and sprint_id not in from_sprints:
+                            add_events.append(self._parse_datetime(created))
+
+                        # Detect REMOVE event: sprint_id in 'from' but not in 'to'
+                        if sprint_id in from_sprints and sprint_id not in to_sprints:
+                            remove_events.append(self._parse_datetime(created))
+
+            # Use LAST add event
+            added_date = add_events[-1] if add_events else None
+
+            # Use LAST remove event (only if it's AFTER the last add)
+            removed_date = None
+            if added_date and remove_events:
+                removes_after_add = [r for r in remove_events if r > added_date]
+                removed_date = removes_after_add[-1] if removes_after_add else None
+
+            return (added_date, removed_date)
+
+        except Exception as e:
+            logger.warning(f"Error calculating sprint dates from issue changelog for sprint {sprint_id}: {e}")
+            return (None, None)
+
+    def _calculate_estimate_at_start(
+        self, issue: Dict, sprint_start_date: str, story_points_field_id: str
+    ) -> Optional[float]:
+        """
+        Calculate estimate_at_start by finding Story Points value at sprint start date.
+
+        Algorithm (Option B - Estimate at sprint START DATE):
+        1. Parse changelog histories from issue JSON
+        2. Find all Story Points changes BEFORE or AT sprint start date
+        3. Return the LAST (most recent) Story Points value <= sprint start date
+        4. If no changelog found, use current Story Points value from fields
+
+        Args:
+            issue: Full issue dict from Jira API (contains changelog.histories and fields)
+            sprint_start_date: Sprint startDate from sprint metadata (ISO format string)
+            story_points_field_id: Story Points field ID from custom_field_mappings (e.g., 'customfield_10024')
+
+        Returns:
+            float: Story Points estimate at sprint start, or None if not found
+        """
+        try:
+            # Parse sprint start date
+            sprint_start = self._parse_datetime(sprint_start_date)
+            if not sprint_start:
+                return None
+
+            changelog = issue.get('changelog', {})
+            histories = changelog.get('histories', [])
+
+            # Track Story Points changes before/at sprint start
+            estimate_changes = []  # List of (timestamp, value) tuples
+
+            # Process changelog to find Story Points changes
+            for history in histories:
+                created = history.get('created')
+                if not created:
+                    continue
+
+                created_dt = self._parse_datetime(created)
+                if not created_dt or created_dt > sprint_start:
+                    continue  # Skip changes after sprint started
+
+                items = history.get('items', [])
+                for item in items:
+                    # Check both 'fieldId' and 'field' for Story Points
+                    field_id = item.get('fieldId')
+                    field_name = item.get('field')
+
+                    # Only process Story Points field changes
+                    if field_id == story_points_field_id or field_name == 'Story Points':
+                        to_value = item.get('to')
+                        if to_value:
+                            try:
+                                estimate_value = float(to_value)
+                                estimate_changes.append((created_dt, estimate_value))
+                            except (ValueError, TypeError):
+                                continue
+
+            # Use the LAST (most recent) estimate change before/at sprint start
+            if estimate_changes:
+                estimate_changes.sort(key=lambda x: x[0])  # Sort by timestamp
+                final_estimate = estimate_changes[-1][1]
+                return final_estimate
+
+            # Fallback: No changelog found, use current Story Points value from fields
+            fields = issue.get('fields', {})
+            current_estimate = fields.get(story_points_field_id)
+            if current_estimate is not None:
+                try:
+                    return float(current_estimate)
+                except (ValueError, TypeError):
+                    return None
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"Error calculating estimate_at_start for issue {issue.get('key', 'unknown')}, sprint start {sprint_start_date}: {e}")
+            return None
+
+    def _process_single_sprint_report(
+        self, db, board_id: int, sprint_id: int, sprint_report: Dict, tenant_id: int, integration_id: int
+    ) -> Optional[str]:
+        """
+        Process a single sprint report and update sprints and work_items_sprints tables.
+
+        Args:
+            db: Database session
+            board_id: Jira board ID
+            sprint_id: Jira sprint ID
+            sprint_report: Sprint report data from Jira API
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+
+        Returns:
+            Sprint external_id if successful, None otherwise
+        """
+        try:
+            # Extract sprint metrics from API response
+            contents = sprint_report.get('contents', {})
+
+            # Extract estimate sums
+            completed_estimate = contents.get('completedIssuesEstimateSum', {}).get('value')
+            not_completed_estimate = contents.get('issuesNotCompletedEstimateSum', {}).get('value')
+            punted_estimate = contents.get('puntedIssuesEstimateSum', {}).get('value')
+            total_estimate = contents.get('allIssuesEstimateSum', {}).get('value')
+
+            # Calculate completion percentage
+            completion_percentage = None
+            if total_estimate and total_estimate > 0:
+                completion_percentage = (completed_estimate / total_estimate) * 100 if completed_estimate else 0
+
+            # Extract scope change metrics
+            completed_issues = contents.get('completedIssues', [])
+            not_completed_issues = contents.get('issuesNotCompletedInCurrentSprint', [])
+            punted_issues = contents.get('puntedIssues', [])
+            issues_added_during_sprint = contents.get('issueKeysAddedDuringSprint', {})
+
+            scope_change_count = len(issues_added_during_sprint)
+            carry_over_count = len(not_completed_issues)
+
+            # Update sprints table with sprint report metrics
+            from app.core.utils import DateTimeHelper
+            now = DateTimeHelper.now_default()
+
+            update_sprint_query = text("""
+                UPDATE sprints
+                SET completed_estimate = :completed_estimate,
+                    not_completed_estimate = :not_completed_estimate,
+                    punted_estimate = :punted_estimate,
+                    total_estimate = :total_estimate,
+                    completion_percentage = :completion_percentage,
+                    velocity = :velocity,
+                    scope_change_count = :scope_change_count,
+                    carry_over_count = :carry_over_count,
+                    last_updated_at = :now
+                WHERE tenant_id = :tenant_id
+                  AND integration_id = :integration_id
+                  AND external_id = :sprint_id
+                  AND board_id = :board_id
+                RETURNING id, external_id
+            """)
+
+            sprint_result = db.execute(update_sprint_query, {
+                'completed_estimate': completed_estimate,
+                'not_completed_estimate': not_completed_estimate,
+                'punted_estimate': punted_estimate,
+                'total_estimate': total_estimate,
+                'completion_percentage': completion_percentage,
+                'velocity': completed_estimate,  # Velocity = completed estimate
+                'scope_change_count': scope_change_count,
+                'carry_over_count': carry_over_count,
+                'now': now,
+                'tenant_id': tenant_id,
+                'integration_id': integration_id,
+                'sprint_id': str(sprint_id),
+                'board_id': board_id
+            })
+
+            sprint_row = sprint_result.fetchone()
+            if not sprint_row:
+                logger.warning(f"Sprint not found for board_id={board_id}, sprint_id={sprint_id} - skipping work_items_sprints update")
+                return None
+
+            sprint_db_id = sprint_row[0]
+            sprint_external_id = sprint_row[1]
+
+            logger.debug(f"Updated sprint {sprint_external_id} (id={sprint_db_id}) with report metrics")
+
+            # Update work_items_sprints table with sprint outcome classification
+            # Map issue keys to outcomes
+            issue_outcomes = {}
+
+            for issue in completed_issues:
+                issue_key = issue.get('key')
+                if issue_key:
+                    issue_outcomes[issue_key] = 'completed'
+
+            for issue in not_completed_issues:
+                issue_key = issue.get('key')
+                if issue_key:
+                    issue_outcomes[issue_key] = 'not_completed'
+
+            for issue in punted_issues:
+                issue_key = issue.get('key')
+                if issue_key:
+                    issue_outcomes[issue_key] = 'punted'
+
+            # Update work_items_sprints records with sprint outcome classification and metrics
+            if issue_outcomes:
+                # Build a map of issue keys to their estimate_at_end values
+                issue_estimates = {}
+                for issue in completed_issues + not_completed_issues + punted_issues:
+                    issue_key = issue.get('key')
+                    if issue_key:
+                        # Extract estimate from issue.estimateStatistic.statFieldValue.value
+                        estimate_stat = issue.get('estimateStatistic', {})
+                        stat_field_value = estimate_stat.get('statFieldValue', {})
+                        estimate_value = stat_field_value.get('value')
+                        issue_estimates[issue_key] = estimate_value
+
+                for issue_key, outcome in issue_outcomes.items():
+                    # Check if issue was added during sprint
+                    added_during_sprint = issue_key in issues_added_during_sprint
+
+                    # Calculate committed: NOT added_during_sprint AND outcome != 'punted'
+                    committed = not added_during_sprint and outcome != 'punted'
+
+                    # Get estimate_at_end for this issue
+                    estimate_at_end = issue_estimates.get(issue_key)
+
+                    # NOTE: added_date, removed_date, and estimate_at_start are now calculated
+                    # in Step 3 (_process_sprint_associations) using changelog from issue JSON.
+                    # Step 5 (sprint reports) only updates sprint outcome metrics, not dates.
+
+                    update_work_items_sprints_query = text("""
+                        UPDATE work_items_sprints wis
+                        SET sprint_outcome = :outcome,
+                            added_during_sprint = :added_during_sprint,
+                            committed = :committed,
+                            estimate_at_end = :estimate_at_end,
+                            last_updated_at = :now
+                        FROM work_items wi
+                        WHERE wis.work_item_id = wi.id
+                          AND wis.sprint_id = :sprint_id
+                          AND wi.key = :issue_key
+                          AND wis.tenant_id = :tenant_id
+                    """)
+
+                    db.execute(update_work_items_sprints_query, {
+                        'outcome': outcome,
+                        'added_during_sprint': added_during_sprint,
+                        'committed': committed,
+                        'estimate_at_end': estimate_at_end,
+                        'now': now,
+                        'sprint_id': sprint_db_id,
+                        'issue_key': issue_key,
+                        'tenant_id': tenant_id
+                    })
+
+                logger.debug(f"Updated {len(issue_outcomes)} work_items_sprints records with sprint outcomes, commitment, and estimates")
+
+            return sprint_external_id
+
+        except Exception as e:
+            logger.error(f"Error processing single sprint report for board_id={board_id}, sprint_id={sprint_id}: {e}")
+            return None
+
+    async def _process_jira_sprint_reports(
+        self, raw_data_id: Optional[int], tenant_id: int, integration_id: int, job_id: int, message: Dict[str, Any]
+    ) -> bool:
+        """
+        Process sprint report data from raw_extraction_data and update sprints and work_items_sprints tables (BATCH MODE).
+
+        NEW BATCH APPROACH:
+        - Processes ONE raw_data record containing up to 100 sprint_report objects
+        - Transforms all sprint_reports in one DB transaction
+        - Queues sprints for embedding
+
+        Flow:
+        1. Load sprint report raw data from raw_extraction_data table
+        2. Extract sprint metrics from API response
+        3. Update sprints table with sprint report metrics (completed_estimate, not_completed_estimate, etc.)
+        4. Update work_items_sprints table with sprint outcome classification
+        5. Queue sprint entity for vectorization using external_id
+
+        Args:
+            raw_data_id: ID of raw data in raw_extraction_data table (None for completion message)
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            job_id: Job ID
+            message: Full message dict with flags
+
+        Returns:
+            bool: True if processing succeeded, False otherwise
+        """
+        try:
+            # 🎯 HANDLE COMPLETION MESSAGE: raw_data_id=None signals job completion
+            if raw_data_id is None and message and message.get('last_job_item'):
+                logger.debug(f"[COMPLETION] Received completion message for jira_sprint_reports (no data to process)")
+                return await self._handle_completion_message('jira_sprint_reports', message)
+
+            logger.debug(f"Processing sprint report from raw_data_id={raw_data_id}")
+
+            # Get database session
+            db = self.database.get_write_session()
+            try:
+                # Load raw data
+                raw_data_query = text("""
+                    SELECT raw_data
+                    FROM raw_extraction_data
+                    WHERE id = :raw_data_id
+                """)
+                result = db.execute(raw_data_query, {'raw_data_id': raw_data_id})
+                row = result.fetchone()
+
+                if not row:
+                    logger.error(f"No raw data found for raw_data_id={raw_data_id}")
+                    return False
+
+                payload = row[0]
+
+                # 🔑 NEW: Check for batch format first
+                sprint_reports_batch = payload.get('sprint_reports_batch')
+
+                if sprint_reports_batch:
+                    # 🔑 NEW: Batch mode - process array of sprint_report objects
+                    logger.info(f"📦 [SPRINT-REPORTS-BATCH] Processing batch of {len(sprint_reports_batch)} sprint reports")
+
+                    # Process each sprint report in the batch
+                    sprints_processed = 0
+                    sprint_entities = []
+
+                    for sprint_report_item in sprint_reports_batch:
+                        board_id = sprint_report_item.get('board_id')
+                        sprint_id = sprint_report_item.get('sprint_id')
+                        sprint_report = sprint_report_item.get('sprint_report', {})
+
+                        logger.debug(f"📦 [SPRINT-REPORTS-BATCH] Processing sprint report for board_id={board_id}, sprint_id={sprint_id}")
+
+                        # Process this sprint report
+                        sprint_external_id = self._process_single_sprint_report(
+                            db, board_id, sprint_id, sprint_report, tenant_id, integration_id
+                        )
+
+                        if sprint_external_id:
+                            sprint_entities.append({'external_id': sprint_external_id})
+                            sprints_processed += 1
+
+                    logger.info(f"📦 [SPRINT-REPORTS-BATCH] Processed {sprints_processed} sprint reports")
+
+                    # Update raw data status to completed
+                    from app.core.utils import DateTimeHelper
+                    now = DateTimeHelper.now_default()
+
+                    update_query = text("""
+                        UPDATE raw_extraction_data
+                        SET status = 'completed',
+                            last_updated_at = :now,
+                            error_details = NULL
+                        WHERE id = :raw_data_id
+                    """)
+                    db.execute(update_query, {'raw_data_id': raw_data_id, 'now': now})
+                    db.commit()
+
+                    # 🚀 Queue sprint entities for embedding in batches of 100
+                    if sprint_entities:
+                        BATCH_SIZE = 100
+                        total_batches = (len(sprint_entities) + BATCH_SIZE - 1) // BATCH_SIZE
+                        logger.info(f"📦 [SPRINT-REPORTS] Batching {len(sprint_entities)} sprints into {total_batches} batches of {BATCH_SIZE}")
+
+                        first_item_flag = message.get('first_item', False)
+                        last_item_flag = message.get('last_item', False)
+                        last_job_item_flag = message.get('last_job_item', False)
+
+                        for batch_idx in range(total_batches):
+                            start_idx = batch_idx * BATCH_SIZE
+                            end_idx = min(start_idx + BATCH_SIZE, len(sprint_entities))
+                            batch_sprints = sprint_entities[start_idx:end_idx]
+
+                            is_first = (batch_idx == 0)
+                            is_last = (batch_idx == total_batches - 1)
+
+                            logger.info(f"📤 [SPRINT-REPORTS] Queuing batch {batch_idx + 1}/{total_batches}: {len(batch_sprints)} sprints, first={is_first}, last={is_last}")
+
+                            self._queue_entities_for_embedding(
+                                tenant_id=tenant_id,
+                                table_name='sprints',
+                                entities=batch_sprints,
+                                job_id=job_id,
+                                message_type='jira_sprint_reports',
+                                integration_id=integration_id,
+                                provider=message.get('provider', 'jira'),
+                                old_last_sync_date=message.get('old_last_sync_date'),
+                                new_last_sync_date=message.get('new_last_sync_date'),
+                                first_item=(first_item_flag and is_first),  # Only first batch gets first_item=True
+                                last_item=(last_item_flag and is_last),  # Only last batch gets last_item=True
+                                last_job_item=(last_job_item_flag and is_last),  # Only last batch gets last_job_item=True
+                                token=message.get('token')
+                            )
+
+                        logger.info(f"✅ [SPRINT-REPORTS-BATCH] Queued {len(sprint_entities)} sprints in {total_batches} batches to embedding")
+
+                    # Send finished status on last item
+                    if message.get('last_item'):
+                        await self._send_worker_status("transform", tenant_id, job_id, "finished", "jira_sprint_reports")
+                        logger.info(f"✅ [SPRINT-REPORTS-BATCH] Transform step marked as finished")
+
+                    return True
+
+                else:
+                    # OLD: Single sprint report format (backward compatibility)
+                    logger.debug(f"⚠️ [SPRINT-REPORTS] Processing single sprint report (old format)")
+
+                    board_id = payload.get('board_id')
+                    sprint_id = payload.get('sprint_id')
+                    sprint_report = payload.get('sprint_report', {})
+
+                    logger.debug(f"Processing sprint report for board_id={board_id}, sprint_id={sprint_id}")
+
+                    # Process this single sprint report
+                    sprint_external_id = self._process_single_sprint_report(
+                        db, board_id, sprint_id, sprint_report, tenant_id, integration_id
+                    )
+
+                    if not sprint_external_id:
+                        logger.warning(f"Failed to process sprint report for board_id={board_id}, sprint_id={sprint_id}")
+                        return False
+
+                    # Update raw data status to completed
+                    from app.core.utils import DateTimeHelper
+                    now = DateTimeHelper.now_default()
+
+                    update_query = text("""
+                        UPDATE raw_extraction_data
+                        SET status = 'completed',
+                            last_updated_at = :now,
+                            error_details = NULL
+                        WHERE id = :raw_data_id
+                    """)
+                    db.execute(update_query, {'raw_data_id': raw_data_id, 'now': now})
+                    db.commit()
+
+                    logger.debug(f"Processed sprint report for sprint {sprint_external_id} - marked raw_data_id={raw_data_id} as completed")
+
+                    # Queue sprint entity for embedding
+                    sprint_entity = {'external_id': sprint_external_id}
+
+                    self._queue_entities_for_embedding(
+                        tenant_id=tenant_id,
+                        table_name='sprints',
+                        entities=[sprint_entity],
+                        job_id=job_id,
+                        message_type='jira_sprint_reports',
+                        integration_id=integration_id,
+                        provider=message.get('provider', 'jira'),
+                        old_last_sync_date=message.get('old_last_sync_date'),
+                        new_last_sync_date=message.get('new_last_sync_date'),
+                        first_item=message.get('first_item', False),
+                        last_item=message.get('last_item', False),
+                        last_job_item=message.get('last_job_item', False),
+                        token=message.get('token')
+                    )
+
+                    logger.info(f"✅ Sprint report processed and queued for embedding: {sprint_external_id}")
+
+                    # Send finished status on last item
+                    if message.get('last_item'):
+                        await self._send_worker_status("transform", tenant_id, job_id, "finished", "jira_sprint_reports")
+
+                    return True
+
+            finally:
+                db.close()
+
+        except Exception as e:
+            logger.error(f"Error processing sprint report: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_dev_status_data(
+        self, db, dev_status_data: List[Dict], integration_id: int, tenant_id: int, job_id: int = None, message: Dict[str, Any] = None
+    ) -> int:
+        """Process dev_status data and insert/update work_items_prs_links table."""
+        from app.core.utils import DateTimeHelper
+
+        # Get work_items map
+        work_items_query = text("""
+            SELECT key, id, external_id
+            FROM work_items
+            WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+        """)
+        work_items_result = db.execute(work_items_query, {
+            'integration_id': integration_id,
+            'tenant_id': tenant_id
+        }).fetchall()
+        work_items_map = {row[0]: {'id': row[1], 'external_id': row[2]} for row in work_items_result}
+
+        # Get existing PR links to avoid duplicates
+        existing_links_query = text("""
+            SELECT work_item_id, external_repo_id, pull_request_number
+            FROM work_items_prs_links
+            WHERE integration_id = :integration_id AND tenant_id = :tenant_id
+        """)
+        existing_result = db.execute(existing_links_query, {
+            'integration_id': integration_id,
+            'tenant_id': tenant_id
+        }).fetchall()
+        existing_links = {(row[0], row[1], row[2]) for row in existing_result}
+
+        pr_links_to_insert = []
+        current_time = DateTimeHelper.now_default()
+
+        for dev_status_item in dev_status_data:
+            try:
+                issue_key = dev_status_item.get('issue_key')
+                if not issue_key or issue_key not in work_items_map:
+                    continue
+
+                work_item_id = work_items_map[issue_key]['id']
+                dev_details = dev_status_item.get('dev_details', {})
+
+                # Extract PR links from dev_details
+                pr_links = self._extract_pr_links_from_dev_status(dev_details)
+
+                for pr_link in pr_links:
+                    # Check if link already exists
+                    link_key = (work_item_id, pr_link['repo_id'], pr_link['pr_number'])
+                    if link_key in existing_links:
+                        continue
+
+                    pr_links_to_insert.append({
+                        'integration_id': integration_id,
+                        'tenant_id': tenant_id,
+                        'work_item_id': work_item_id,
+                        'external_repo_id': pr_link['repo_id'],
+                        'repo_full_name': pr_link.get('repo_name', ''),
+                        'pull_request_number': pr_link['pr_number'],
+                        'branch_name': pr_link.get('branch'),
+                        'commit_sha': pr_link.get('commit'),
+                        'pr_status': pr_link.get('status'),
+                        'active': True,
+                        'created_at': current_time,
+                        'last_updated_at': current_time
+                    })
+
+            except Exception as e:
+                logger.error(f"Error processing dev_status for issue {dev_status_item.get('issue_key', 'unknown')}: {e}")
+                continue
+
+        # Get flags from incoming message to forward to embedding
+        first_item = message.get('first_item', False) if message else False
+        last_item = message.get('last_item', False) if message else False
+        last_job_item = message.get('last_job_item', False) if message else False
+        provider = message.get('provider') if message else 'jira'
+        old_last_sync_date = message.get('old_last_sync_date') if message else None  # 🔑 From extraction worker
+        new_last_sync_date = message.get('new_last_sync_date') if message else None
+        token = message.get('token') if message else None  # 🔑 Extract token from message
+
+        logger.info(f"🎯 [DEV_STATUS] Flags from transform message: first_item={first_item}, last_item={last_item}, last_job_item={last_job_item}")
+
+        # Bulk insert PR links
+        if pr_links_to_insert:
+            BulkOperations.bulk_insert(db, 'work_items_prs_links', pr_links_to_insert)
+            logger.debug(f"Inserted {len(pr_links_to_insert)} new PR links")
+
+            # Fetch the inserted records with their generated IDs for vectorization
+            inserted_links = self._fetch_inserted_pr_links(db, pr_links_to_insert, integration_id, tenant_id)
+
+            # 🚀 Queue for embedding in batches of 100
+            if inserted_links:
+                BATCH_SIZE = 100
+                total_batches = (len(inserted_links) + BATCH_SIZE - 1) // BATCH_SIZE
+                logger.info(f"📦 [DEV_STATUS] Batching {len(inserted_links)} PR links into {total_batches} batches of {BATCH_SIZE}")
+
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * BATCH_SIZE
+                    end_idx = min(start_idx + BATCH_SIZE, len(inserted_links))
+                    batch_links = inserted_links[start_idx:end_idx]
+
+                    is_first = (batch_idx == 0)
+                    is_last = (batch_idx == total_batches - 1)
+
+                    logger.info(f"📤 [DEV_STATUS] Queuing batch {batch_idx + 1}/{total_batches}: {len(batch_links)} PR links, first={is_first}, last={is_last}")
+
+                    # Queue batch for embedding - only first batch gets first_item=True, only last batch gets last_item=True
+                    self._queue_entities_for_embedding(
+                        tenant_id=tenant_id,
+                        table_name='work_items_prs_links',
+                        entities=batch_links,
+                        job_id=job_id,
+                        message_type='jira_dev_status',
+                        integration_id=integration_id,
+                        provider=provider,
+                        old_last_sync_date=old_last_sync_date,
+                        new_last_sync_date=new_last_sync_date,
+                        first_item=(first_item and is_first),  # Only first batch gets first_item=True
+                        last_item=(last_item and is_last),  # Only last batch gets last_item=True
+                        last_job_item=(last_job_item and is_last),  # Only last batch gets last_job_item=True
+                        token=token
+                    )
+
+                logger.info(f"✅ [DEV_STATUS] Queued {len(inserted_links)} PR links in {total_batches} batches to embedding")
+        else:
+            # No PR links to insert - send message to embedding if first_item=True OR last_item=True
+            # This ensures WebSocket status updates are sent even when there are no entities
+            if first_item or last_item:
+                logger.debug(f"🎯 [DEV_STATUS] No PR links to insert, sending flag message to embedding (first={first_item}, last={last_item})")
+                self._queue_entities_for_embedding(
+                    tenant_id=tenant_id,
+                    table_name='work_items_prs_links',
+                    entities=[],  # Empty entities
+                    job_id=job_id,
+                    message_type='jira_dev_status',
+                    integration_id=integration_id,
+                    provider=provider,
+                    old_last_sync_date=old_last_sync_date,
+                    new_last_sync_date=new_last_sync_date,
+                    first_item=first_item,
+                    last_item=last_item,
+                    last_job_item=last_job_item,
+                    token=token
+                )
+
+        # ✅ Send WebSocket status update when last_item=True (OUTSIDE the if block)
+        if last_item and job_id:
+            logger.info(f"🏁 [DEV_STATUS] Sending 'finished' status for transform step")
+            await self.status_manager.send_worker_status(
+                step="transform",
+                tenant_id=tenant_id,
+                job_id=job_id,
+                status="finished",
+                step_type="jira_dev_status"
+            )
+            logger.info(f"✅ [DEV_STATUS] Transform step marked as finished")
+
+        return len(pr_links_to_insert)
+
+    def _fetch_inserted_pr_links(
+        self, db, pr_links_to_insert: List[Dict], integration_id: int, tenant_id: int
+    ) -> List[Dict]:
+        """
+        Fetch the inserted PR links with their generated IDs.
+
+        This is needed because bulk_insert doesn't return the generated IDs,
+        but we need them for vectorization queueing.
+
+        Args:
+            db: Database session
+            pr_links_to_insert: List of PR link dicts that were just inserted
+            integration_id: Integration ID
+            tenant_id: Tenant ID
+
+        Returns:
+            List of PR link dicts with 'id' field populated
+        """
+        if not pr_links_to_insert:
+            return []
+
+        try:
+            # Build a query to fetch all the inserted records
+            # We'll match on (work_item_id, external_repo_id, pull_request_number) which is unique
+            conditions = []
+            for link in pr_links_to_insert:
+                conditions.append(
+                    f"(work_item_id = {link['work_item_id']} AND "
+                    f"external_repo_id = '{link['external_repo_id']}' AND "
+                    f"pull_request_number = {link['pull_request_number']})"
+                )
+
+            where_clause = " OR ".join(conditions)
+
+            query = text(f"""
+                SELECT id, work_item_id, external_repo_id, pull_request_number
+                FROM work_items_prs_links
+                WHERE integration_id = :integration_id
+                  AND tenant_id = :tenant_id
+                  AND ({where_clause})
+            """)
+
+            result = db.execute(query, {
+                'integration_id': integration_id,
+                'tenant_id': tenant_id
+            }).fetchall()
+
+            # Convert to list of dicts with 'id' field
+            fetched_links = [
+                {
+                    'id': row[0],
+                    'work_item_id': row[1],
+                    'external_repo_id': row[2],
+                    'pull_request_number': row[3]
+                }
+                for row in result
+            ]
+
+            logger.debug(f"Fetched {len(fetched_links)} PR links with IDs for vectorization")
+            return fetched_links
+
+        except Exception as e:
+            logger.error(f"Error fetching inserted PR links: {e}")
+            return []
+
+    def _extract_pr_links_from_dev_status(self, dev_details: Dict) -> List[Dict]:
+        """Extract PR links from Jira dev_status API response."""
+        pr_links = []
+
+        try:
+            if not isinstance(dev_details, dict) or 'detail' not in dev_details:
+                return pr_links
+
+            for detail in dev_details['detail']:
+                if not isinstance(detail, dict):
+                    continue
+
+                # Get pull requests from detail
+                pull_requests = detail.get('pullRequests', [])
+                for pr in pull_requests:
+                    try:
+                        # Extract PR information
+                        pr_url = pr.get('url', '')
+                        pr_id = pr.get('id', '')
+                        pr_name = pr.get('name', '')
+                        pr_status = pr.get('status', '')
+
+                        # Parse PR number and repo from URL or name
+                        # Example URL: https://github.com/wexinc/health-api/pull/123
+                        pr_number = None
+                        repo_name = ''
+                        repo_id = ''
+
+                        if pr_url:
+                            parts = pr_url.split('/')
+                            if len(parts) >= 2:
+                                pr_number = int(parts[-1]) if parts[-1].isdigit() else None
+                                if len(parts) >= 5:
+                                    repo_name = f"{parts[-4]}/{parts[-3]}"
+                                    repo_id = pr.get('repositoryId', repo_name)
+
+                        if not pr_number:
+                            # Try to extract from name (e.g., "#123")
+                            if pr_name.startswith('#'):
+                                pr_number = int(pr_name[1:]) if pr_name[1:].isdigit() else None
+
+                        if pr_number:
+                            pr_links.append({
+                                'repo_id': repo_id or pr_id,
+                                'repo_name': repo_name,
+                                'pr_number': pr_number,
+                                'branch': pr.get('source', {}).get('branch'),
+                                'commit': pr.get('lastCommit', {}).get('id'),
+                                'status': pr_status
+                            })
+
+                    except Exception as e:
+                        logger.warning(f"Error parsing PR from dev_status: {e}")
+                        continue
+
+        except Exception as e:
+            logger.error(f"Error extracting PR links from dev_status: {e}")
+
+        return pr_links
+
+    def _parse_datetime(self, date_str: str):
+        """Parse datetime string from Jira API."""
+        if not date_str:
+            return None
+
+        try:
+            from datetime import datetime
+            # Jira returns ISO 8601 format: 2024-01-15T10:30:00.000+0000
+            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        except Exception as e:
+            logger.warning(f"Error parsing datetime '{date_str}': {e}")
+            return None
+
+    def _calculate_pr_metrics(self, pr_data: Dict[str, Any], commits: List[Dict[str, Any]], reviews: List[Dict[str, Any]], comments: List[Dict[str, Any]], review_threads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Calculate PR metrics from GraphQL data (based on old etl-service logic).
+
+        Args:
+            pr_data: PR data from GraphQL
+            commits: List of commits
+            reviews: List of reviews
+            comments: List of comments
+            review_threads: List of review threads
+
+        Returns:
+            Dictionary with calculated metrics
+        """
+        metrics = {
+            'commit_count': 0,
+            'additions': 0,
+            'deletions': 0,
+            'changed_files': 0,
+            'source': None,
+            'destination': None,
+            'reviewers': 0,
+            'first_review_at': None,
+            'rework_commit_count': 0,
+            'review_cycles': 0,
+            'discussion_comment_count': 0,
+            'review_comment_count': 0
+        }
+
+        try:
+            # 1. Count commits and sum additions/deletions/changed_files
+            metrics['commit_count'] = len(commits) if commits else 0
+            for commit in (commits or []):
+                commit_data = commit.get('commit', {})
+                metrics['additions'] += commit_data.get('additions', 0) or 0
+                metrics['deletions'] += commit_data.get('deletions', 0) or 0
+                metrics['changed_files'] += commit_data.get('changedFiles', 0) or 0
+
+            # 2. Extract source and destination branches
+            if pr_data.get('headRef'):
+                metrics['source'] = pr_data['headRef'].get('name')
+            if pr_data.get('baseRef'):
+                metrics['destination'] = pr_data['baseRef'].get('name')
+
+            # 3. Calculate review metrics
+            if reviews:
+                # Get unique reviewers
+                reviewers = set()
+                review_times = []
+
+                for review in reviews:
+                    if review.get('author', {}).get('login'):
+                        reviewers.add(review['author']['login'])
+
+                    if review.get('submittedAt'):
+                        review_time = self._parse_datetime(review['submittedAt'])
+                        if review_time:
+                            review_times.append(review_time)
+
+                metrics['reviewers'] = len(reviewers)
+
+                # Get first review time
+                if review_times:
+                    metrics['first_review_at'] = min(review_times)
+
+                # Count review cycles (CHANGES_REQUESTED or APPROVED)
+                metrics['review_cycles'] = len([r for r in reviews if r.get('state') in ['CHANGES_REQUESTED', 'APPROVED']])
+
+            # 4. Calculate rework commits (commits after first review)
+            if metrics['first_review_at'] and commits:
+                for commit in commits:
+                    commit_data = commit.get('commit', {})
+                    if commit_data.get('author', {}).get('date'):
+                        commit_date = self._parse_datetime(commit_data['author']['date'])
+                        if commit_date and commit_date > metrics['first_review_at']:
+                            metrics['rework_commit_count'] += 1
+
+            # 5. Count comments
+            metrics['discussion_comment_count'] = len(comments) if comments else 0
+
+            # 6. Count review thread comments
+            for thread in (review_threads or []):
+                thread_comments = thread.get('comments', {}).get('nodes', [])
+                metrics['review_comment_count'] += len(thread_comments)
+
+        except Exception as e:
+            logger.error(f"Error calculating PR metrics: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+        return metrics
+
+    def _update_job_status(self, job_id: int, step_name: str, step_status: str, message: str = None):
+        """Update ETL job step status in database JSON structure."""
+        try:
+            from app.core.database import get_database
+            from sqlalchemy import text
+            from app.core.utils import DateTimeHelper
+
+            now = DateTimeHelper.now_default()
+
+            database = get_database()
+            with database.get_write_session_context() as session:
+                # Update specific step status within the JSON structure
+                # Only update overall status to RUNNING if not already running
+                # Use string formatting for step_name and step_status to avoid parameter binding issues
+                update_query = text(f"""
+                    UPDATE etl_jobs
+                    SET status = jsonb_set(
+                            jsonb_set(status, ARRAY['steps', '{step_name}', 'transform'], '"{step_status}"'::jsonb),
+                            ARRAY['overall'],
+                            CASE
+                                WHEN status->>'overall' = 'READY' THEN '"RUNNING"'::jsonb
+                                ELSE status->'overall'
+                            END
+                        ),
+                        last_updated_at = :now
+                    WHERE id = :job_id
+                """)
+
+                session.execute(update_query, {
+                    'job_id': job_id,
+                    'now': now
+                })
+                session.commit()
+
+                logger.debug(f"Updated job {job_id} step {step_name} transform status to {step_status}")
+                if message:
+                    logger.debug(f"Job {job_id} message: {message}")
+
+        except Exception as e:
+            logger.error(f"Error updating job status: {e}")
+
+    # ============ CONFIG JOB PROCESSING METHODS ============
+
+    async def _process_config_projects_and_issue_types(self, tenant_id: int, integration_id: int, job_id: int, message: Dict[str, Any]) -> bool:
+        """
+        Process Projects & Types for Config job (Step 1).
+
+        This step reuses the same logic as jira_projects_and_issue_types but runs in the Config job.
+        It reads from raw_extraction_data, transforms projects and WITs, and queues for embedding.
+
+        Args:
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            job_id: Job ID
+            message: Message containing flags and raw_data_id
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # Extract raw_data_id from message (set by extraction worker)
+            raw_data_id = message.get('raw_data_id')
+            logger.info(f"🏁 [CONFIG] Processing Projects & Types (config job, raw_data_id={raw_data_id})")
+
+            # Reuse the existing Jira projects and issue types processing logic
+            # This will read from raw_extraction_data, transform, and queue for embedding
+            # The step name is automatically extracted from message['type']
+            return await self._process_jira_project_search(raw_data_id, tenant_id, integration_id, job_id, message)
+
+        except Exception as e:
+            logger.error(f"❌ [CONFIG] Error processing Projects & Types: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_config_statuses_and_relations(self, tenant_id: int, integration_id: int, job_id: int, message: Dict[str, Any]) -> bool:
+        """
+        Process Statuses & Relations for Config job (Step 2).
+
+        This step reuses the same logic as jira_statuses_and_relationships but runs in the Config job.
+        It reads from raw_extraction_data, transforms statuses and relationships, and queues for embedding.
+
+        Args:
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            job_id: Job ID
+            message: Message containing flags and raw_data_id
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # Extract raw_data_id from message (set by extraction worker)
+            raw_data_id = message.get('raw_data_id')
+            logger.info(f"🏁 [CONFIG] Processing Statuses & Relations (config job, raw_data_id={raw_data_id})")
+
+            # Reuse the existing Jira statuses and relationships processing logic
+            # This will read from raw_extraction_data, transform, and queue for embedding
+            # The step name is automatically extracted from message['type']
+            return await self._process_jira_statuses_and_project_relationships(raw_data_id, tenant_id, integration_id, job_id, message)
+
+        except Exception as e:
+            logger.error(f"❌ [CONFIG] Error processing Statuses & Relations: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_config_wit_hierarchies(self, tenant_id: int, integration_id: int, job_id: int, message: Dict[str, Any]) -> bool:
+        """
+        Process WIT Hierarchies for Config job (Step 1).
+
+        This step has no extraction phase - it reads directly from wit_hierarchies table,
+        processes the data, and queues for embedding in batches of 100.
+
+        Args:
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            job_id: Job ID
+            message: Message containing flags
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            first_item = message.get('first_item', False)
+            last_item = message.get('last_item', False)
+            last_job_item = message.get('last_job_item', False)
+            token = message.get('token')
+
+            logger.info(f"🏁 [CONFIG] Processing WIT Hierarchies (first={first_item}, last={last_item}, last_job={last_job_item})")
+
+            # Note: "transform running" status is sent by TransformWorkerRouter, not here (avoids duplicate status updates)
+
+            # Read WIT hierarchies from database
+            try:
+                with self.get_db_read_session() as session:
+                    query = text("""
+                        SELECT id
+                        FROM wits_hierarchies
+                        WHERE tenant_id = :tenant_id
+                        AND integration_id = :integration_id
+                        AND active = true
+                    """)
+                    result = session.execute(query, {
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id
+                    }).fetchall()
+
+                    # Use internal id (these tables don't have external_id column)
+                    hierarchies = [{'id': row[0]} for row in result]
+                    logger.info(f"📊 Found {len(hierarchies)} WIT hierarchies to embed")
+            except Exception as e:
+                # Table doesn't exist or other DB error - treat as no data
+                logger.warning(f"⚠️ Could not read wits_hierarchies table: {e}")
+                hierarchies = []
+
+            # Check if there are any hierarchies to embed
+            if not hierarchies:
+                # No hierarchies found - early closure (skip embedding)
+                logger.info(f"🎯 [EARLY CLOSURE] No WIT hierarchies found - skipping embedding")
+
+                # Send both transform AND embedding "finished" status
+                if job_id:
+                    await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_wit_hierarchies")
+                    logger.info(f"✅ Transform marked as finished (no data)")
+
+                    await self._send_worker_status("embedding", tenant_id, job_id, "finished", "config_wit_hierarchies")
+                    logger.info(f"✅ Embedding marked as finished (no data - early closure)")
+            else:
+                # 📦 Batch entities into groups of 100
+                BATCH_SIZE = 100
+                total_entities = len(hierarchies)
+                batches = [hierarchies[i:i + BATCH_SIZE] for i in range(0, total_entities, BATCH_SIZE)]
+                total_batches = len(batches)
+
+                logger.info(f"📦 Batching {total_entities} hierarchies into {total_batches} batches of {BATCH_SIZE}")
+
+                # Queue batches to embedding
+                import pika
+                import json
+
+                with self.queue_manager.get_channel() as channel:
+                    for batch_idx, batch in enumerate(batches):
+                        is_first_batch = (batch_idx == 0)
+                        is_last_batch = (batch_idx == total_batches - 1)
+
+                        message_to_send = {
+                            'tenant_id': tenant_id,
+                            'integration_id': integration_id,
+                            'job_id': job_id,
+                            'type': 'config_wit_hierarchies',
+                            'provider': 'jira',
+                            'first_item': is_first_batch,  # Only first batch gets first_item=True
+                            'last_item': is_last_batch,    # Only last batch gets last_item=True
+                            'old_last_sync_date': None,
+                            'new_last_sync_date': None,
+                            'last_job_item': last_job_item if is_last_batch else False,  # Only last batch can have last_job_item
+                            'token': token,
+                            'rate_limited': False,
+                            'table_name': 'wits_hierarchies',
+                            'entities': batch,
+                            'external_id': 'batch'
+                        }
+
+                        tier = self.queue_manager._get_tenant_tier(tenant_id)
+                        tier_queue = self.queue_manager.get_tier_queue_name(tier, 'embedding')
+
+                        channel.basic_publish(
+                            exchange='',
+                            routing_key=tier_queue,
+                            body=json.dumps(message_to_send, cls=DateTimeEncoder),  # Use custom encoder for datetime objects
+                            properties=pika.BasicProperties(
+                                delivery_mode=2,
+                                content_type='application/json'
+                            )
+                        )
+
+                        logger.debug(f"📤 Queued batch {batch_idx + 1}/{total_batches} ({len(batch)} hierarchies)")
+
+                logger.info(f"✅ Queued {total_batches} batches to embedding")
+
+                # Send "transform finished" status (always send since we processed the data)
+                if job_id:
+                    await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_wit_hierarchies")
+
+            logger.info(f"✅ WIT Hierarchies processing completed")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Error processing WIT Hierarchies: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_config_wit_mappings(self, tenant_id: int, integration_id: int, job_id: int, message: Dict[str, Any]) -> bool:
+        """
+        Process WIT Mappings for Config job (Step 2).
+
+        This step has no extraction phase - it reads directly from wit_mappings table,
+        processes the data, and queues for embedding in batches of 100.
+
+        Args:
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            job_id: Job ID
+            message: Message containing flags
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            first_item = message.get('first_item', False)
+            last_item = message.get('last_item', False)
+            last_job_item = message.get('last_job_item', False)
+            token = message.get('token')
+
+            logger.info(f"🏁 [CONFIG] Processing WIT Mappings (first={first_item}, last={last_item}, last_job={last_job_item})")
+
+            # Note: "transform running" status is sent by TransformWorkerRouter, not here (avoids duplicate status updates)
+
+            # Read WIT mappings from database
+            try:
+                with self.get_db_read_session() as session:
+                    query = text("""
+                        SELECT id
+                        FROM wits_mappings
+                        WHERE tenant_id = :tenant_id
+                        AND integration_id = :integration_id
+                        AND active = true
+                    """)
+                    result = session.execute(query, {
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id
+                    }).fetchall()
+
+                    # Use internal id (these tables don't have external_id column)
+                    mappings = [{'id': row[0]} for row in result]
+                    logger.info(f"📊 Found {len(mappings)} WIT mappings to embed")
+            except Exception as e:
+                # Table doesn't exist or other DB error - treat as no data
+                logger.warning(f"⚠️ Could not read wits_mappings table: {e}")
+                mappings = []
+
+            # Check if there are any mappings to embed
+            if not mappings:
+                # No mappings found - early closure (skip embedding)
+                logger.info(f"🎯 [EARLY CLOSURE] No WIT mappings found - skipping embedding")
+
+                # Send both transform AND embedding "finished" status
+                if job_id:
+                    await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_wit_mappings")
+                    logger.info(f"✅ Transform marked as finished (no data)")
+
+                    await self._send_worker_status("embedding", tenant_id, job_id, "finished", "config_wit_mappings")
+                    logger.info(f"✅ Embedding marked as finished (no data - early closure)")
+            else:
+                # 📦 Batch entities into groups of 100
+                BATCH_SIZE = 100
+                total_entities = len(mappings)
+                batches = [mappings[i:i + BATCH_SIZE] for i in range(0, total_entities, BATCH_SIZE)]
+                total_batches = len(batches)
+
+                logger.info(f"📦 Batching {total_entities} mappings into {total_batches} batches of {BATCH_SIZE}")
+
+                # Queue batches to embedding
+                import pika
+                import json
+
+                with self.queue_manager.get_channel() as channel:
+                    for batch_idx, batch in enumerate(batches):
+                        is_first_batch = (batch_idx == 0)
+                        is_last_batch = (batch_idx == total_batches - 1)
+
+                        message_to_send = {
+                            'tenant_id': tenant_id,
+                            'integration_id': integration_id,
+                            'job_id': job_id,
+                            'type': 'config_wit_mappings',
+                            'provider': 'jira',
+                            'first_item': is_first_batch,  # Only first batch gets first_item=True
+                            'last_item': is_last_batch,    # Only last batch gets last_item=True
+                            'old_last_sync_date': None,
+                            'new_last_sync_date': None,
+                            'last_job_item': last_job_item if is_last_batch else False,  # Only last batch can have last_job_item
+                            'token': token,
+                            'rate_limited': False,
+                            'table_name': 'wits_mappings',
+                            'entities': batch,
+                            'external_id': 'batch'
+                        }
+
+                        tier = self.queue_manager._get_tenant_tier(tenant_id)
+                        tier_queue = self.queue_manager.get_tier_queue_name(tier, 'embedding')
+
+                        channel.basic_publish(
+                            exchange='',
+                            routing_key=tier_queue,
+                            body=json.dumps(message_to_send, cls=DateTimeEncoder),  # Use custom encoder for datetime objects
+                            properties=pika.BasicProperties(
+                                delivery_mode=2,
+                                content_type='application/json'
+                            )
+                        )
+
+                        logger.debug(f"📤 Queued batch {batch_idx + 1}/{total_batches} ({len(batch)} mappings)")
+
+                logger.info(f"✅ Queued {total_batches} batches to embedding")
+
+                # Send "transform finished" status (always send since we processed the data)
+                if job_id:
+                    await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_wit_mappings")
+
+            logger.info(f"✅ WIT Mappings processing completed")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Error processing WIT Mappings: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_config_status_mappings(self, tenant_id: int, integration_id: int, job_id: int, message: Dict[str, Any]) -> bool:
+        """
+        Process Status Mappings for Config job (Step 3).
+
+        This step has no extraction phase - it reads directly from status_mappings table,
+        processes the data, and queues for embedding in batches of 100.
+
+        Args:
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            job_id: Job ID
+            message: Message containing flags
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            first_item = message.get('first_item', False)
+            last_item = message.get('last_item', False)
+            last_job_item = message.get('last_job_item', False)
+            token = message.get('token')
+
+            logger.info(f"🏁 [CONFIG] Processing Status Mappings (first={first_item}, last={last_item}, last_job={last_job_item})")
+
+            # Note: "transform running" status is sent by TransformWorkerRouter, not here (avoids duplicate status updates)
+
+            # Read status mappings from database
+            try:
+                with self.get_db_read_session() as session:
+                    query = text("""
+                        SELECT id
+                        FROM statuses_mappings
+                        WHERE tenant_id = :tenant_id
+                        AND integration_id = :integration_id
+                        AND active = true
+                    """)
+                    result = session.execute(query, {
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id
+                    }).fetchall()
+
+                    # Use internal id (these tables don't have external_id column)
+                    mappings = [{'id': row[0]} for row in result]
+                    logger.info(f"📊 Found {len(mappings)} status mappings to embed")
+            except Exception as e:
+                # Table doesn't exist or other DB error - treat as no data
+                logger.warning(f"⚠️ Could not read statuses_mappings table: {e}")
+                mappings = []
+
+            # Check if there are any mappings to embed
+            if not mappings:
+                # No mappings found - early closure (skip embedding)
+                logger.info(f"🎯 [EARLY CLOSURE] No status mappings found - skipping embedding")
+
+                # Send both transform AND embedding "finished" status
+                if job_id:
+                    await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_status_mappings")
+                    logger.info(f"✅ Transform marked as finished (no data)")
+
+                    await self._send_worker_status("embedding", tenant_id, job_id, "finished", "config_status_mappings")
+                    logger.info(f"✅ Embedding marked as finished (no data - early closure)")
+            else:
+                # 📦 Batch entities into groups of 100
+                BATCH_SIZE = 100
+                total_entities = len(mappings)
+                batches = [mappings[i:i + BATCH_SIZE] for i in range(0, total_entities, BATCH_SIZE)]
+                total_batches = len(batches)
+
+                logger.info(f"📦 Batching {total_entities} status mappings into {total_batches} batches of {BATCH_SIZE}")
+
+                # Queue batches to embedding
+                import pika
+                import json
+
+                with self.queue_manager.get_channel() as channel:
+                    for batch_idx, batch in enumerate(batches):
+                        is_first_batch = (batch_idx == 0)
+                        is_last_batch = (batch_idx == total_batches - 1)
+
+                        message_to_send = {
+                            'tenant_id': tenant_id,
+                            'integration_id': integration_id,
+                            'job_id': job_id,
+                            'type': 'config_status_mappings',
+                            'provider': 'jira',
+                            'first_item': is_first_batch,  # Only first batch gets first_item=True
+                            'last_item': is_last_batch,    # Only last batch gets last_item=True
+                            'old_last_sync_date': None,
+                            'new_last_sync_date': None,
+                            'last_job_item': last_job_item if is_last_batch else False,  # Only last batch can have last_job_item
+                            'token': token,
+                            'rate_limited': False,
+                            'table_name': 'statuses_mappings',
+                            'entities': batch,
+                            'external_id': 'batch'
+                        }
+
+                        tier = self.queue_manager._get_tenant_tier(tenant_id)
+                        tier_queue = self.queue_manager.get_tier_queue_name(tier, 'embedding')
+
+                        channel.basic_publish(
+                            exchange='',
+                            routing_key=tier_queue,
+                            body=json.dumps(message_to_send, cls=DateTimeEncoder),  # Use custom encoder for datetime objects
+                            properties=pika.BasicProperties(
+                                delivery_mode=2,
+                                content_type='application/json'
+                            )
+                        )
+
+                        logger.debug(f"📤 Queued batch {batch_idx + 1}/{total_batches} ({len(batch)} status mappings)")
+
+                logger.info(f"✅ Queued {total_batches} batches to embedding")
+
+                # Send "transform finished" status (always send since we processed the data)
+                if job_id:
+                    await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_status_mappings")
+
+            logger.info(f"✅ Status Mappings processing completed")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Error processing Status Mappings: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    async def _process_config_workflows(self, tenant_id: int, integration_id: int, job_id: int, message: Dict[str, Any]) -> bool:
+        """
+        Process Workflows for Config job (Step 4).
+
+        This step has no extraction phase - it reads directly from workflows table,
+        processes the data, and queues for embedding in batches of 100.
+
+        Note: This is NOT the last step - custom_fields (Step 5) is the last step.
+
+        Args:
+            tenant_id: Tenant ID
+            integration_id: Integration ID
+            job_id: Job ID
+            message: Message containing flags
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            first_item = message.get('first_item', False)
+            last_item = message.get('last_item', False)
+            last_job_item = message.get('last_job_item', False)
+            token = message.get('token')
+
+            logger.info(f"🏁 [CONFIG WORKFLOWS] Processing Workflows (first={first_item}, last={last_item}, last_job={last_job_item}, job_id={job_id})")
+
+            # Note: "transform running" status is sent by TransformWorkerRouter, not here (avoids duplicate status updates)
+
+            # Read workflows from database
+            try:
+                with self.get_db_read_session() as session:
+                    query = text("""
+                        SELECT id
+                        FROM workflows
+                        WHERE tenant_id = :tenant_id
+                        AND integration_id = :integration_id
+                        AND active = true
+                    """)
+                    result = session.execute(query, {
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id
+                    }).fetchall()
+
+                    # Use internal id (these tables don't have external_id column)
+                    workflows = [{'id': row[0]} for row in result]
+                    logger.info(f"📊 Found {len(workflows)} workflows to embed")
+            except Exception as e:
+                # Table doesn't exist or column doesn't exist - treat as no data
+                logger.warning(f"⚠️ Could not read workflows table: {e}")
+                workflows = []
+
+            # Check if there are any workflows to embed
+            if not workflows:
+                # No workflows found - early closure (skip embedding)
+                logger.info(f"🎯 [EARLY CLOSURE] No workflows found - skipping embedding")
+
+                # Send both transform AND embedding "finished" status
+                if job_id:
+                    await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_workflows")
+                    logger.info(f"✅ Transform marked as finished (no data)")
+
+                    await self._send_worker_status("embedding", tenant_id, job_id, "finished", "config_workflows")
+                    logger.info(f"✅ Embedding marked as finished (no data - early closure)")
+            else:
+                # 📦 Batch entities into groups of 100
+                BATCH_SIZE = 100
+                total_entities = len(workflows)
+                batches = [workflows[i:i + BATCH_SIZE] for i in range(0, total_entities, BATCH_SIZE)]
+                total_batches = len(batches)
+
+                logger.info(f"📦 Batching {total_entities} workflows into {total_batches} batches of {BATCH_SIZE}")
+
+                # Queue batches to embedding
+                import pika
+                import json
+
+                with self.queue_manager.get_channel() as channel:
+                    for batch_idx, batch in enumerate(batches):
+                        is_first_batch = (batch_idx == 0)
+                        is_last_batch = (batch_idx == total_batches - 1)
+
+                        message_to_send = {
+                            'tenant_id': tenant_id,
+                            'integration_id': integration_id,
+                            'job_id': job_id,
+                            'type': 'config_workflows',
+                            'provider': 'jira',
+                            'first_item': is_first_batch,  # Only first batch gets first_item=True
+                            'last_item': is_last_batch,    # Only last batch gets last_item=True
+                            'old_last_sync_date': None,
+                            'new_last_sync_date': None,
+                            'last_job_item': last_job_item if is_last_batch else False,  # Only last batch can have last_job_item
+                            'token': token,
+                            'rate_limited': False,
+                            'table_name': 'workflows',
+                            'entities': batch,
+                            'external_id': 'batch'
+                        }
+
+                        tier = self.queue_manager._get_tenant_tier(tenant_id)
+                        tier_queue = self.queue_manager.get_tier_queue_name(tier, 'embedding')
+
+                        channel.basic_publish(
+                            exchange='',
+                            routing_key=tier_queue,
+                            body=json.dumps(message_to_send, cls=DateTimeEncoder),  # Use custom encoder for datetime objects
+                            properties=pika.BasicProperties(
+                                delivery_mode=2,
+                                content_type='application/json'
+                            )
+                        )
+
+                        logger.debug(f"📤 Queued batch {batch_idx + 1}/{total_batches} ({len(batch)} workflows)")
+
+                logger.info(f"✅ Queued {total_batches} workflows batches to embedding")
+
+            # 📦 Now batch workflows_steps (individual steps within workflows)
+            try:
+                with self.get_db_read_session() as session:
+                    query = text("""
+                        SELECT id
+                        FROM workflows_steps
+                        WHERE tenant_id = :tenant_id
+                        AND integration_id = :integration_id
+                        AND active = true
+                    """)
+                    result = session.execute(query, {
+                        'tenant_id': tenant_id,
+                        'integration_id': integration_id
+                    }).fetchall()
+
+                    # Use internal id (these tables don't have external_id column)
+                    workflows_steps = [{'id': row[0]} for row in result]
+                    logger.info(f"📊 Found {len(workflows_steps)} workflows_steps to embed")
+            except Exception as e:
+                # Table doesn't exist or column doesn't exist - treat as no data
+                logger.warning(f"⚠️ Could not read workflows_steps table: {e}")
+                workflows_steps = []
+
+            # Check if there are any workflows_steps to embed
+            if workflows_steps:
+                # 📦 Batch entities into groups of 100
+                BATCH_SIZE = 100
+                total_entities = len(workflows_steps)
+                batches = [workflows_steps[i:i + BATCH_SIZE] for i in range(0, total_entities, BATCH_SIZE)]
+                total_batches = len(batches)
+
+                logger.info(f"📦 Batching {total_entities} workflows_steps into {total_batches} batches of {BATCH_SIZE}")
+
+                # Queue batches to embedding
+                import pika
+                import json
+
+                with self.queue_manager.get_channel() as channel:
+                    for batch_idx, batch in enumerate(batches):
+                        is_first_batch = (batch_idx == 0)
+                        is_last_batch = (batch_idx == total_batches - 1)
+
+                        message_to_send = {
+                            'tenant_id': tenant_id,
+                            'integration_id': integration_id,
+                            'job_id': job_id,
+                            'type': 'config_workflows',  # Same step type as workflows
+                            'provider': 'jira',
+                            'first_item': False,  # workflows_steps never gets first_item (workflows already sent it)
+                            'last_item': is_last_batch,    # Only last batch gets last_item=True
+                            'old_last_sync_date': None,
+                            'new_last_sync_date': None,
+                            'last_job_item': last_job_item if is_last_batch else False,  # Only last batch can have last_job_item
+                            'token': token,
+                            'rate_limited': False,
+                            'table_name': 'workflows_steps',
+                            'entities': batch,
+                            'external_id': 'batch'
+                        }
+
+                        tier = self.queue_manager._get_tenant_tier(tenant_id)
+                        tier_queue = self.queue_manager.get_tier_queue_name(tier, 'embedding')
+
+                        channel.basic_publish(
+                            exchange='',
+                            routing_key=tier_queue,
+                            body=json.dumps(message_to_send, cls=DateTimeEncoder),  # Use custom encoder for datetime objects
+                            properties=pika.BasicProperties(
+                                delivery_mode=2,
+                                content_type='application/json'
+                            )
+                        )
+
+                        logger.debug(f"📤 Queued batch {batch_idx + 1}/{total_batches} ({len(batch)} workflows_steps)")
+
+                logger.info(f"✅ Queued {total_batches} workflows_steps batches to embedding")
+            else:
+                logger.info(f"🎯 No workflows_steps found - skipping")
+
+            # Send "transform finished" status (always send since we processed the data)
+            if job_id:
+                await self._send_worker_status("transform", tenant_id, job_id, "finished", "config_workflows")
+
+            logger.info(f"✅ Workflows and workflows_steps processing completed")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Error processing Workflows: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+

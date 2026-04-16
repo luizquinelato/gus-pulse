@@ -1,0 +1,669 @@
+# ETL GitHub Job Lifecycle
+
+This document explains how GitHub ETL jobs work, including the 2-step extraction process with nested pagination, status management, flag handling, and completion patterns.
+
+## Job Status Structure
+
+```json
+{
+  "overall": "READY|RUNNING|FINISHED|FAILED",
+  "steps": {
+    "step_name": {
+      "order": 1,
+      "display_name": "Step Display Name",
+      "extraction": "idle|running|finished|failed",
+      "transform": "idle|running|finished|failed",
+      "embedding": "idle|running|finished|failed"
+    }
+  }
+}
+```
+
+---
+
+## Step Structure
+
+GitHub has 2 steps:
+1. `github_repositories` - Extract all repositories
+2. `github_prs_commits_reviews_comments` - Extract PRs with nested data (commits, reviews, comments)
+
+---
+
+## Data Extraction Rules
+
+**Step 1: Repositories**
+- Extraction fetches all repositories (paginated)
+- Stores each repository in raw_extraction_data with type: `github_repositories`
+- Queues MULTIPLE messages to transform queue with:
+  - `type: 'github_repositories'`
+  - First repository: `first_item=True, last_item=False`
+  - Middle repositories: `first_item=False, last_item=False`
+  - Last repository: `first_item=False, last_item=True`
+- Transform processes each message and queues to embedding with same flags
+- Embedding processes each message
+- When `last_item=True`: sends "finished" status
+
+**Step 1 → Step 2 Transition (Extraction Worker Queues Next Extraction)**
+- ✅ **CORRECTED**: Extraction worker (Step 1) queues Step 2 extraction directly - NO backwards communication
+
+**Extraction Worker (Step 1) - LOOP 1: Queue all repositories to Transform**
+- Iterates through all extracted repositories
+- For each repo: stores in raw_extraction_data, queues to transform queue
+- First repository: `first_item=True`
+- Last repository: `last_item=True`
+- ✅ **LOOP 1 COMPLETES** - all repos queued to transform
+
+**Extraction Worker (Step 1) - LOOP 2: Queue all repositories to Step 2 Extraction**
+- ✅ **SAME EXTRACTION WORKER** - no waiting for transform
+- Iterates through all extracted repositories (same list from LOOP 1)
+- For each repo: queues to extraction queue for Step 2 (NO database query)
+- First repository: `first_item=True` (marks start of Step 2)
+- Last repository: `last_item=True`
+- Each message includes: `owner`, `repo_name`, `full_name`, `integration_id`, `last_sync_date`, `new_last_sync_date`
+- ✅ **NO database queries**: Uses repo data directly from extraction
+- ✅ **NO backwards communication**: Transform worker does NOT queue extraction
+- ✅ **Parallel processing**: Transform processes repos while extraction processes PRs
+
+**Transform Worker - Process Repositories**
+- Receives repository messages from transform queue
+- Inserts each repository into database
+- Queues to embedding with same flags
+- ✅ **No Step 2 queuing**: Extraction worker already queued Step 2
+
+**Extraction Worker (Step 2)**
+- Receives PR extraction messages from extraction queue
+- Uses `owner`, `repo_name`, `last_sync_date` from message (NO database query for repository)
+- Extracts PRs using GraphQL and queues to transform
+
+**Step 1 Completion (No Repositories Case)**
+- If NO repositories are extracted:
+  - Extraction worker directly marks all steps as finished via WebSocket:
+    - Step 1 (repositories): extraction, transform, embedding → "finished"
+    - Step 2 (prs_commits_reviews_comments): extraction, transform, embedding → "finished"
+    - Overall job status → "FINISHED"
+    - Updates `last_sync_date` in database
+  - ✅ **Direct status updates** - no queue messages needed since no data was extracted
+  - **Job ends** - no Step 2 (PRs) since there are no repositories
+
+**Step 2: PRs with Nested Data (Complex Multi-Phase) by Repository**
+
+**Extraction Overview**
+- Extraction fetches each Repository's PRs using GraphQL
+- GraphQL response can have multiple PRs requiring multiple pages to get all PRs for a specific Repository
+  - When multiple pages exist: queue another message to ExtractionWorker with next page cursor using `type: 'github_prs_commits_reviews_comments'`
+  - Each extraction worker processes one page at a time (PR page or nested page)
+- Each PR node can have internal nested nodes: commits, reviews, comments, reviewThreads
+- Any nested node can have one or multiple pages
+  - Single page: data is inside the PR node
+  - Multiple pages: queue messages to ExtractionWorker for remaining pages using `type: 'github_prs_commits_reviews_comments'` with nested type specified
+
+**When Processing PR Page**
+- ExtractionWorker splits response JSON by PR and inserts each in raw_extraction_data with type: `github_prs`
+- Queues individual message to transform queue by PR with: `type: 'github_prs_commits_reviews_comments'`
+
+**When Processing Nested Page**
+- ExtractionWorker splits response JSON by nested type (commits, reviews, comments, reviewThreads) and inserts in raw_extraction_data with type: `github_prs_nested`
+- Queues individual message to transform queue by nested type with: `type: 'github_prs_commits_reviews_comments'`
+
+**Transform**
+- Transform processes each PR or nested message by getting raw_id from the message
+- Retrieves data from raw_extraction_data table
+- Converts to specific database entity and inserts/updates in the database
+- After committing changes, queues to embedding using external_id (from raw_extraction_data JSON) and table_name
+
+**Embedding**
+- Embedding processes each message by getting database value based on external_id and table_name
+- Sends to embedding provider using integration details and configurations
+- Saves data in qdrant_vectors table (bridge table) in primary database
+- Inserts/Updates specific collection in Qdrant database
+
+---
+
+## Flag Handling: first_item, last_item, last_job_item, last_repo, last_pr
+
+### **Flag Definitions**
+
+- **first_item**: True only on the first item in a sequence (for WebSocket status updates)
+- **last_item**: True only on the last item in a sequence (for WebSocket status updates and step completion)
+- **last_job_item**: True only when the entire job should complete (triggers job completion in embedding worker)
+- **last_repo**: Internal flag used by extraction worker to track repository boundaries - indicates this is the last repository
+- **last_pr**: Internal flag used by extraction worker to track PR boundaries within the last repository - indicates this is the last PR of the last repository
+
+### **Extraction Worker (Step 2)**
+
+**When first_item=true (First Repository's PR extraction)**
+- Receives first_item=true from extraction queue message (queued by extraction worker Step 1)
+- Updates step status to running and sends WebSocket notification
+- Forwards first_item=true to the very FIRST PR message sent to TransformWorker
+
+**When last_item=true and last_job_item=true (Last Repository's PR extraction)**
+- Performs GraphQL request and checks: **Is this the last PR page?**
+
+  **Case 1.1: YES - This is the last PR page**
+  - Splits response by PRs and loops through checking for nested pagination needs
+  - **Is there any nested pagination needed in any of those PRs?**
+
+    **Case 1.1.2.1: NO nested pagination needed**
+    - Sends last_item=true and last_job_item=true to the LAST PR message to TransformWorker
+    - All other PRs sent with last_item=false, last_job_item=false
+
+    **Case 1.1.2.2: YES nested pagination needed**
+    - **Loop 1: Queue all PRs to TransformWorker** with last_item=false, last_job_item=false
+    - **Loop 2: Queue nested extraction jobs** for each PR needing nested pagination:
+      - For each nested type (commits → reviews → comments → reviewThreads order):
+        - If this is NOT the last nested type: queue with last_pr=false
+        - If this IS the last nested type: queue with last_pr=true ✅
+      - Example: If PR needs commits, reviews, comments only (no reviewThreads):
+        - commits: last_pr=false
+        - reviews: last_pr=false
+        - comments: last_pr=true ✅ (last nested type)
+    - Nested extraction workers continue processing pages and forward flags through
+    - On final nested page of final nested type: sends last_item=true, last_job_item=true to TransformWorker
+
+  **Case 1.2: NO - More PR pages exist**
+  - Queues next PR page to ExtractionWorker with last_item=false, last_job_item=false, last_repo=true
+  - Sends ALL PR messages in current page to TransformWorker with last_item=false, last_job_item=false
+
+**Case 2: If no more PR pages exist**
+- Continues checking until reaching final page (Case 1.1 above)
+- After finding the right last item extracted: updates step status to finished and sends WebSocket notification
+
+### **Transform Worker**
+
+**When first_item=true (First PR of first Repository)**
+- Updates step status to running and sends WebSocket notification
+- Forwards first_item=true to EmbeddingWorker
+
+**When last_item=true and last_job_item=true (Last PR or last nested item from last PR of last repository)**
+- Updates step status to finished and sends WebSocket notification
+- Forwards last_item=true and last_job_item=true to EmbeddingWorker
+
+### **Embedding Worker**
+
+**When first_item=true (First PR of first Repository)**
+- Updates step status to running and sends WebSocket notification
+
+**When last_item=true and last_job_item=true (Last PR or last nested item from last PR of last repository)**
+- Performs all embedding processing
+- Updates step status AND overall job status to finished
+- Sends WebSocket notification for UI update
+
+---
+
+---
+
+## Critical Rules for GitHub Step 2
+
+1. **last_repo and last_pr Flags (Extraction Worker Internal)**
+   - `last_repo=true` is sent to extraction worker when processing the last repository
+   - `last_pr=true` is set by extraction worker when queuing nested extraction for the last PR that needs nested pagination
+   - These flags help extraction worker determine when to set `last_item=true, last_job_item=true`
+   - **Rule for PR queuing**: Set `last_item=true, last_job_item=true` on last PR ONLY when:
+     - This is the last PR in the page AND no more PR pages
+     - AND no nested pagination needed for ANY PR
+     - AND `last_repo=true` AND `last_pr=true`
+
+2. **Nested Type Ordering**
+   - Nested types are processed in fixed order: commits → reviews → comments → reviewThreads
+   - When queuing nested extraction for a PR needing pagination:
+     - Set `last_pr=false` on all nested types EXCEPT the last one
+     - Set `last_pr=true` ONLY on the final nested type that needs extraction
+   - Example: If PR needs commits and comments only:
+     - commits: `last_pr=false`
+     - comments: `last_pr=true` ✅ (last nested type)
+
+3. **Flag Propagation Through Pipeline**
+   - Extraction determines when last_item=true and last_job_item=true based on PR pages and nested pagination
+   - Transform forwards these flags to Embedding
+   - Embedding uses last_job_item=true to finalize the job
+   - **Status Update Rule**: Only send "finished" status when sending `last_item=true` to transform
+
+4. **Nested Pagination Flag Handling**
+   - Nested extraction workers receive `last_pr=true` on the final nested type
+   - When processing nested pages with `last_pr=true`:
+     - If more pages exist: queue next page with `last_item=false, last_job_item=false, last_pr=true`
+     - If final page: send to transform with `last_item=true, last_job_item=true, last_pr=true`
+   - This ensures job completion only after all nested data is processed
+
+5. **Multiple PR Pages**
+   - When more PR pages exist: queue next page with last_item=false, last_job_item=false, last_repo=true
+   - Current page PRs sent to Transform with last_item=false, last_job_item=false
+   - Extraction continues until reaching final PR page
+
+6. **No Nested Pagination Needed**
+   - When last PR page has no nested pagination: send last_item=true, last_job_item=true on last PR
+   - Job completion happens immediately after Transform and Embedding process this message
+
+---
+
+## GitHub Completion Scenarios
+
+**Scenario 1: Normal Flow (Repositories + PRs with Nested Data)**
+```
+Step 1 (repositories) → Step 2 (PRs + nested pagination)
+                                        ↓
+                        last_item=true, last_job_item=true
+                        (on last nested item of last PR)
+                                        ↓
+                        Queue completion message to transform
+                                        ↓
+                                Job FINISHED
+```
+
+**Scenario 2: No Repositories Found**
+```
+Step 1 (no repositories)
+        ↓
+Direct WebSocket status updates:
+  - Step 1 (repos): extraction/transform/embedding → finished
+  - Step 2 (PRs): extraction/transform/embedding → finished
+  - Overall → FINISHED
+        ↓
+Job FINISHED (no queue messages)
+```
+
+**Scenario 3: No PRs Found on Last Repository**
+```
+Step 1 (repositories) → Step 2 (last repo has no PRs)
+                                        ↓
+                        Direct WebSocket status updates:
+                          - Step 2: extraction/transform/embedding → finished
+                          - Overall → FINISHED
+                                        ↓
+                                Job FINISHED (no queue messages)
+```
+
+**Scenario 4: Rate Limit Hit During PR Extraction**
+```
+Step 1 (repositories) → Step 2 (PRs extraction - rate limit hit)
+                                        ↓
+                        Save checkpoint for recovery
+                                        ↓
+                        Queue completion message to transform
+                        (allows already-queued items to process)
+                                        ↓
+                                Job FINISHED
+```
+
+**Scenario 5: Rate Limit Hit During Nested Extraction**
+```
+Step 1 (repositories) → Step 2 (nested data - rate limit hit)
+                                        ↓
+                        Save checkpoint for recovery
+                                        ↓
+                        Queue completion message to transform
+                        (allows already-queued items to process)
+                                        ↓
+                                Job FINISHED
+```
+
+---
+
+## GitHub Completion Flow
+
+### Queue-Based Completion (Normal Flow & Rate Limit Cases)
+
+Used when data was extracted and items may be queued to transform/embedding workers.
+
+1. **Extraction Worker** sends completion message with last_item=true, last_job_item=true when:
+   - Last PR page with no nested pagination: on last PR message
+   - Last PR page with nested pagination: on last nested type message
+   - Rate limit hit during PR extraction: after saving checkpoint
+   - Rate limit hit during nested extraction: after saving checkpoint
+
+2. **Transform Worker** receives message with last_job_item=true:
+   - Recognizes as job completion signal
+   - Sends "finished" status for transform step (because last_item=true)
+   - Forwards to embedding with last_job_item=true
+
+3. **Embedding Worker** receives message with last_job_item=true:
+   - Sends "finished" status for embedding step (because `last_item=True`)
+   - Calls `complete_etl_job()` (because `last_job_item=True`)
+   - Sets overall status to FINISHED
+   - Sets `reset_deadline` = current time + 30 seconds
+   - Sets `reset_attempt` = 0
+   - Schedules delayed task to check and reset job
+
+### Direct Status Update Completion (No Data Cases)
+
+Used when no data was extracted, so no items are queued to workers.
+
+1. **Extraction Worker** directly marks all steps as finished:
+   - **No repositories found**: Marks both Step 1 and Step 2 as finished (6 statuses total)
+   - **No PRs on last repository**: Marks only Step 2 as finished (3 statuses)
+   - Calls `status_manager.complete_etl_job()` to set overall status to FINISHED
+   - Sets `reset_deadline` = current time + 30 seconds
+   - Sets `reset_attempt` = 0
+   - Schedules delayed task to check and reset job
+   - Updates `last_sync_date` in database
+
+2. **No queue messages sent** - instant completion without worker involvement
+
+### System-Level Reset Flow (Both Patterns)
+
+After job completion (overall status = FINISHED):
+
+1. **Backend Scheduler** (`job_reset_scheduler.py`):
+   - After 30 seconds, runs `reset_check_task()` via `threading.Timer`
+   - Verifies all steps are finished
+   - Checks all queues (extraction, transform, embedding) for remaining messages with job token
+   - **If work remains**:
+     - Extends deadline (60s, 180s, 300s) and updates database
+     - Does NOT send WebSocket (workers handle their own status updates)
+     - Schedules next check using `threading.Timer`
+   - **If all complete**:
+     - Resets job to READY, all steps to 'idle'
+     - Sends WebSocket update to notify UI
+
+2. **UI Countdown** (system-level, not per-session):
+   - Receives `reset_deadline` via WebSocket
+   - Calculates remaining time: `deadline - current_time`
+   - Displays "Resetting in 30s", "Resetting in 29s", etc.
+   - All users see the same countdown
+
+---
+
+## Token Forwarding Through GitHub Pipeline
+
+Every GitHub job uses a **unique token (UUID)** that is generated at job start and forwarded through ALL stages for job tracking and correlation.
+
+### Token Flow for Each Step
+
+**Step 1: github_repositories**
+```
+Job Start (token generated)
+    ↓ token in message
+Extraction → Transform Queue
+    ↓ token in message
+Transform → Embedding Queue
+    ↓ token in message
+Embedding Worker
+```
+
+**Step 2: github_prs_commits_reviews_comments (with nested pagination)**
+```
+Extraction (Initial PR page) → Transform Queue
+    ↓ token in message
+Extraction (Nested pagination) → Extraction Queue (line 1353 in github_extraction.py)
+    ↓ token in message (CRITICAL: Must forward token for nested extraction)
+Extraction Worker (processes nested page)
+    ↓ token in message
+Transform → Embedding Queue
+    ↓ token in message
+Embedding Worker
+```
+
+### Critical Implementation Points
+
+1. **github_extraction.py line 1353**: Must include `token=token` when queuing nested extraction jobs
+   - This ensures nested pagination messages (commits, reviews, comments) maintain the token
+   - Without this, token becomes `None` after first nested page
+
+2. **transform_worker.py line 4155**: Extract token from message for repositories step
+   - `token = message.get('token') if message else None`
+
+3. **transform_worker.py line 4189**: Forward token when queuing repositories to embedding
+   - `token=token` parameter in `publish_embedding_job()`
+
+4. **transform_worker.py line 3676**: Extract token from message for PR/nested step
+   - `token = message.get('token') if message else None`
+
+5. **transform_worker.py line 5077**: Forward token when queuing PR entities to embedding
+   - `token=token` parameter in `publish_embedding_job()`
+
+### Token Verification for GitHub
+
+To verify token is properly forwarded through nested pagination:
+1. Check logs for token value in first repository message
+2. Verify same token appears in first PR message
+3. Verify same token appears in nested extraction messages (commits, reviews, comments)
+4. Confirm token is present in all embedding worker logs
+5. Token should NOT become `None` at any stage, especially during nested pagination
+
+---
+
+## Date Forwarding for Incremental Sync
+
+Every GitHub job uses **two date fields** for incremental sync:
+- `old_last_sync_date` (or `last_sync_date`): Used for filtering data during extraction (from previous job run)
+- `new_last_sync_date`: Extraction start time that will be saved for the next incremental run
+
+### Date Flow Through Pipeline
+
+**Step 1: github_repositories**
+```
+Job Start (reads last_sync_date from database)
+    ↓ old_last_sync_date in message
+Extraction Worker (sets new_last_sync_date = current date)
+    ↓ old_last_sync_date + new_last_sync_date in message
+Transform Queue
+    ↓ MUST forward both dates
+Transform Worker
+    ↓ old_last_sync_date + new_last_sync_date in message
+Embedding Queue
+    ↓ new_last_sync_date used for database update
+Embedding Worker (updates last_sync_date when last_job_item=True)
+```
+
+**Step 2: github_prs_commits_reviews_comments**
+```
+Extraction Worker (receives dates from Step 1)
+    ↓ old_last_sync_date + new_last_sync_date in message
+Transform Queue
+    ↓ MUST forward both dates
+Transform Worker
+    ↓ old_last_sync_date + new_last_sync_date in message
+Embedding Queue
+    ↓ new_last_sync_date used for database update
+Embedding Worker (updates last_sync_date when last_job_item=True)
+```
+
+### Critical Implementation Points
+
+1. **Extraction Worker**: Sets `new_last_sync_date = DateTimeHelper.now_default()` at extraction start
+   - This captures the extraction start time in configured timezone (America/New_York from .env)
+   - Uses `old_last_sync_date` for filtering (e.g., `pushed:2025-11-11..2025-11-12`)
+   - **Important**: All timestamps use `DateTimeHelper.now_default()` for timezone consistency
+
+2. **Transform Worker - Regular Processing**: Must forward both dates to embedding
+   - `github_transform_worker.py` line 265: Extract `new_last_sync_date` from message
+   - `github_transform_worker.py` line 444: Forward `new_last_sync_date` to embedding queue
+
+3. **Transform Worker - Completion Messages**: Must forward both dates to embedding
+   - `github_transform_worker.py` line 188: Forward `new_last_sync_date` for repositories completion
+   - `github_transform_worker.py` line 213: Forward `new_last_sync_date` for PRs completion
+
+4. **Embedding Worker**: Updates database when `last_job_item=True`
+   - Calls `_complete_etl_job(job_id, tenant_id, new_last_sync_date)`
+   - Updates `last_sync_date` column in `etl_jobs` table
+   - Next run will use this value as `old_last_sync_date`
+
+### Incremental Sync Behavior
+
+**First Run (no last_sync_date in database)**
+- `old_last_sync_date = None`
+- Extraction uses 2-year default: `pushed:2023-11-12..2025-11-11`
+- Sets `new_last_sync_date = 2025-11-11`
+- Embedding worker updates database: `last_sync_date = 2025-11-11`
+
+**Second Run (last_sync_date exists in database)**
+- `old_last_sync_date = 2025-11-11` (from database)
+- Extraction uses incremental range: `pushed:2025-11-11..2025-11-12`
+- Sets `new_last_sync_date = 2025-11-12`
+- Embedding worker updates database: `last_sync_date = 2025-11-12`
+- **Saves API quota**: Only fetches repositories/PRs updated since last run
+
+### Date Verification for GitHub
+
+To verify dates are properly forwarded:
+1. Check logs for `new_last_sync_date` in extraction worker output
+2. Verify both dates appear in transform queue messages
+3. Verify both dates appear in embedding queue messages
+4. Confirm `last_sync_date` is updated in database after job completion
+5. Verify next run uses previous `new_last_sync_date` as `old_last_sync_date`
+
+---
+
+## Known Issues and Limitations
+
+### Rate Limit Handling - Critical Issues
+
+**Problem 1: Checkpoint Overwriting Race Condition**
+
+When multiple workers process repositories in parallel and hit rate limits simultaneously:
+
+```
+Timeline:
+T=0: Worker 1 processes Repo 456, hits rate limit
+     └─ Saves checkpoint: { "last_pr_cursor": "abc123" }
+
+T=1: Worker 2 processes Repo 457, hits rate limit
+     └─ Saves checkpoint: { "last_pr_cursor": "def456" } ← OVERWRITES Worker 1's checkpoint!
+
+T=2: Worker 3 processes Repo 458, hits rate limit
+     └─ Saves checkpoint: { "last_pr_cursor": "ghi789" } ← OVERWRITES again!
+
+Result: Only the LAST worker's checkpoint is saved, all others are LOST
+```
+
+**Impact:**
+- ❌ Only one repository's checkpoint is preserved (the last one to hit rate limit)
+- ❌ All other repositories' progress is lost
+- ❌ Cannot resume properly - missing cursor information for most repos
+- ❌ Checkpoint data in `etl_jobs.checkpoint_data` is overwritten by concurrent workers
+
+**Problem 2: Multiple Completion Messages**
+
+Each worker that hits a rate limit sends a completion message:
+
+```
+T=0: Worker 1 hits rate limit → sends completion message (last_job_item=True)
+T=1: Worker 2 hits rate limit → sends completion message (last_job_item=True)
+T=2: Worker 3 hits rate limit → sends completion message (last_job_item=True)
+...
+Result: Job marked FINISHED multiple times, WebSocket sends "finished" status repeatedly
+```
+
+**Impact:**
+- ⚠️ Job status updated to FINISHED multiple times (redundant database writes)
+- ⚠️ WebSocket sends "finished" status multiple times
+- ⚠️ UI countdown timer may reset multiple times
+- ⚠️ Database performance degradation from redundant UPDATEs
+
+**Problem 3: Workers Continue Processing After Rate Limit**
+
+Workers don't stop when rate limit is hit - they continue consuming from the queue:
+
+```
+Scenario: 912 repositories queued, rate limit hit at repo 456
+
+What happens:
+- Worker 1 processes repo 456 → rate limit → saves checkpoint → continues to repo 461
+- Worker 2 processes repo 457 → rate limit → overwrites checkpoint → continues to repo 462
+- Worker 3 processes repo 458 → rate limit → overwrites checkpoint → continues to repo 463
+- ... this continues for ALL remaining 456 repos
+- All 456 repos hit rate limit immediately
+- Each one overwrites the checkpoint
+- Massive waste of API quota (all requests fail)
+```
+
+**Impact:**
+- ❌ All remaining repositories in queue are attempted (and fail)
+- ❌ Wastes GitHub API quota (456+ failed requests)
+- ❌ Checkpoint overwritten 456+ times
+- ❌ No way to track which repositories were attempted vs not attempted
+
+**Problem 4: Missing Repository Context in Checkpoint**
+
+Current checkpoint structure doesn't identify which repository it belongs to:
+
+```json
+// Current checkpoint (INCOMPLETE):
+{
+  "rate_limit_hit": true,
+  "rate_limit_node_type": "prs",
+  "last_pr_cursor": "abc123",  // ← Which repo does this cursor belong to?
+  "rate_limit_reset_at": "2025-11-14T18:00:00Z"
+}
+
+// Missing information:
+// - Which repository was being processed?
+// - Which repositories are still pending?
+// - Which repositories were already completed?
+```
+
+**Impact:**
+- ❌ Cannot identify which repository the cursor belongs to
+- ❌ Cannot resume specific repository on recovery
+- ❌ No visibility into which repositories are pending vs completed
+- ❌ Recovery logic cannot determine where to restart
+
+### ✅ IMPLEMENTED SOLUTION: Per-Repository Checkpoint System
+
+**Implementation Date:** 2025-11-17
+
+The checkpoint system has been fully implemented using **Solution 2: Per-Repository Checkpoint Table**.
+
+**New Architecture:**
+
+1. **Dedicated Checkpoint Table:** `etl_jobs_github_checkpoints`
+   - Each repository gets its own checkpoint record
+   - Atomic UPSERT operations prevent race conditions
+   - Tracks status: 'pending' or 'completed'
+   - Stores checkpoint_data (cursor, nested state) when rate limited
+
+2. **Boolean Flag for Fast Checking:** `etl_jobs.checkpoint_data`
+   - Changed from JSONB to BOOLEAN
+   - Fast check: "Does this job have any checkpoints?"
+   - Set to `true` when ANY repo hits rate limit
+   - Workers check this flag and skip ALL repos if true (prevents wasted API calls)
+
+3. **Checkpoint Lifecycle:**
+   ```
+   Repository Extraction (LOOP 1):
+   └─ Create checkpoint record for each repo (status='pending', checkpoint_data=NULL)
+
+   PR Extraction:
+   ├─ Check boolean flag → if true, skip ALL repos
+   ├─ Process repo normally
+   ├─ If rate limit hit:
+   │  ├─ Save checkpoint_data={node_type, last_pr_cursor, rate_limit_reset_at}
+   │  └─ Set etl_jobs.checkpoint_data=true
+   └─ If repo completes: Update status='completed', checkpoint_data=NULL
+
+   Nested Extraction:
+   ├─ If rate limit hit:
+   │  ├─ Save checkpoint_data={node_type, current_pr_node_id, nested_cursor}
+   │  └─ Set etl_jobs.checkpoint_data=true
+   └─ If nested completes: Update status='completed', checkpoint_data=NULL
+
+   Job Completion:
+   └─ Delete all checkpoint records and clear boolean flag
+   ```
+
+4. **Recovery Flow:**
+   ```
+   User clicks "Run Now" on RATE_LIMITED job:
+   ├─ Check etl_jobs.checkpoint_data boolean flag
+   ├─ Query checkpoints WHERE checkpoint_data IS NOT NULL
+   ├─ For each checkpoint with data:
+   │  ├─ If node_type='prs': Queue PR extraction with saved cursor
+   │  └─ If node_type in nested types: Queue nested extraction with saved cursor
+   └─ Resume from exact point where rate limit occurred
+   ```
+
+**Benefits:**
+- ✅ No race conditions - each repo has its own checkpoint row
+- ✅ All repositories' progress preserved (not just the last one)
+- ✅ Fine-grained recovery - resume exactly where rate limit occurred
+- ✅ Skip ALL repos when ANY hits rate limit (prevents wasted API calls)
+- ✅ Token-based deduplication for idempotent processing
+- ✅ Clean separation: boolean flag for checking, dedicated table for data
+
+**Files Modified:**
+- `scripts/migrations/0001_initial_db_schema.py` - Added checkpoint table, changed checkpoint_data to boolean
+- `app/models/unified_models.py` - Added EtlJobsGithubCheckpoint model
+- `app/etl/github/github_extraction_worker.py` - Added checkpoint helper functions and logic
+- `app/etl/github/github_embedding_worker.py` - Added checkpoint cleanup on job completion
+- `app/etl/jobs.py` - Updated recovery logic to use new checkpoint system
+

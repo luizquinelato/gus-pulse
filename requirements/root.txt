@@ -1,0 +1,8 @@
+# Root-level dependencies
+# Used by standalone scripts in /scripts that run outside any service venv
+
+# Encryption utilities (scripts/generate_secret_key.py)
+cryptography
+
+# HTTP client (scripts/augment_jira_integration/jira_agent_client.py)
+httpx

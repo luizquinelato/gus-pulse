@@ -1,0 +1,1061 @@
+{
+  "metadata": {
+    "extracted_at": "2026-03-13T22:19:58.364391",
+    "tenant_id": 1,
+    "integration_id": 1,
+    "description": "Mapping tables seed data for WEX tenant"
+  },
+  "workflows": [
+    {
+      "name": "Story-level Workflow",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "name": "Epic-Level Workflow",
+      "integration_name": "Jira",
+      "active": true
+    }
+  ],
+  "workflow_steps": [
+    {
+      "workflow_name": "Epic-Level Workflow",
+      "step_name": "BACKLOG",
+      "order": 1,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Epic-Level Workflow",
+      "step_name": "DEVELOPMENT",
+      "order": 2,
+      "status_name": null,
+      "is_commitment_point": true,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Epic-Level Workflow",
+      "step_name": "DEPLOYED TO PRODUCTION",
+      "order": 3,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Epic-Level Workflow",
+      "step_name": "RELEASED",
+      "order": 4,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Story-level Workflow",
+      "step_name": "BACKLOG",
+      "order": 1,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Story-level Workflow",
+      "step_name": "TO DO",
+      "order": 4,
+      "status_name": null,
+      "is_commitment_point": true,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Story-level Workflow",
+      "step_name": "IN PROGRESS",
+      "order": 5,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Story-level Workflow",
+      "step_name": "READY FOR TEST",
+      "order": 6,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Story-level Workflow",
+      "step_name": "IN TEST",
+      "order": 7,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Story-level Workflow",
+      "step_name": "READY FOR UAT",
+      "order": 8,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Story-level Workflow",
+      "step_name": "UAT",
+      "order": 9,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Story-level Workflow",
+      "step_name": "READY FOR PRODUCTION",
+      "order": 10,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "workflow_name": "Story-level Workflow",
+      "step_name": "DONE",
+      "order": 11,
+      "status_name": null,
+      "is_commitment_point": false,
+      "integration_name": "Jira",
+      "active": true
+    }
+  ],
+  "statuses_categories": [
+    {
+      "name": "To Do",
+      "description": "Work not yet started",
+      "is_waiting": false,
+      "is_done": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "name": "In Progress",
+      "description": "Work in progress",
+      "is_waiting": false,
+      "is_done": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "name": "Waiting",
+      "description": "Work waiting for next step",
+      "is_waiting": true,
+      "is_done": false,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "name": "Done",
+      "description": "Work completed",
+      "is_waiting": false,
+      "is_done": true,
+      "integration_name": "Jira",
+      "active": true
+    }
+  ],
+  "statuses_mappings": [
+    {
+      "status_from": "Acceptance Testing",
+      "status_to": "UAT",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Active",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Analysis",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Applied to Prod",
+      "status_to": "Done",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Applied to Prod/TRN",
+      "status_to": "Done",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Applied to QA",
+      "status_to": "In Test",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Applied to STG",
+      "status_to": "Ready for Test",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Applied to TRN",
+      "status_to": "Ready for UAT",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Applied to UAT",
+      "status_to": "Ready for UAT",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Approved",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Awaiting Deployment",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Blocked",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Building",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Cancelled",
+      "status_to": "Discarded",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Closed",
+      "status_to": "Done",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Closure",
+      "status_to": "Done",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Code Review",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Codereview",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Coding",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Coding Done",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Committed",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Composting",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Created",
+      "status_to": "Backlog",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Deploy",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Deployed to Dev",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Deployed to Production",
+      "status_to": "Done",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Deploying Applications",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Deploying Database",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Deploying Demo",
+      "status_to": "Ready for Test",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Deployment",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Design",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Development",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Discovery",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Escalated",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Final Checks",
+      "status_to": "UAT",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "In Development",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "In Review",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "In Stage Testing",
+      "status_to": "In Test",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "In Testing",
+      "status_to": "In Test",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "In Triage",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Merging Branches",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "New",
+      "status_to": "Backlog",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "On Hold",
+      "status_to": "On Hold",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Onboarding Templates",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Open",
+      "status_to": "Backlog",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Peer Review",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Pending Approval",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Pipeline Approval Pending",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Planned",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Pre Production Testing",
+      "status_to": "UAT",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Pre-readiness",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Prerefinement",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Promoted to QA",
+      "status_to": "In Test",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Promoted to UAT",
+      "status_to": "Ready for UAT",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Proposed",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "QA",
+      "status_to": "In Test",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "QA in Progress",
+      "status_to": "In Test",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for Acceptance",
+      "status_to": "Ready for UAT",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for Demo",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for Development",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for Peer Review",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for QA",
+      "status_to": "Ready for Test",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for QA build",
+      "status_to": "Ready for Test",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for Release",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for Stage",
+      "status_to": "Ready for UAT",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for Story Testing",
+      "status_to": "Ready for Test",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for Testing",
+      "status_to": "Ready for Test",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for prd",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready for prod",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready to Dep to Dev",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready to Dep to Prod",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready to Development",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready to Launch",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready to Refine",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Ready to Work",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Refined",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Refinement",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Refining",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Regression Testing",
+      "status_to": "UAT",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Rejected",
+      "status_to": "Discarded",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Release Approval Pending",
+      "status_to": "UAT",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Release Deployed",
+      "status_to": "Done",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Release Pending",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Release Testing",
+      "status_to": "UAT",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Released",
+      "status_to": "Done",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Removed",
+      "status_to": "Done",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Resolved",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Review",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Selected for development",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Story Testing",
+      "status_to": "In Test",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Tech Review",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Template Approval Pending",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Templates",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Test",
+      "status_to": "In Test",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Testing",
+      "status_to": "In Test",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Training",
+      "status_to": "In Progress",
+      "category_name": "In Progress",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Validated in Prod",
+      "status_to": "Done",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Validated in QA",
+      "status_to": "Ready for UAT",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Validated in STG",
+      "status_to": "Ready for UAT",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Validated in TRN",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Validated in UAT",
+      "status_to": "Ready for Production",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Waiting Partner",
+      "status_to": "In Progress",
+      "category_name": "Waiting",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Waiting for refinement",
+      "status_to": "To Do",
+      "category_name": "To Do",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "status_from": "Withdrawn",
+      "status_to": "Discarded",
+      "category_name": "Done",
+      "integration_name": "Jira",
+      "active": true
+    }
+  ],
+  "wits_hierarchies": [
+    {
+      "name": "Sub-task",
+      "level": -1,
+      "description": "Internal Checklist Points",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "name": "Story",
+      "level": 0,
+      "description": "Small chunk of work",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "name": "Epic",
+      "level": 1,
+      "description": "Big chunk of work",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "name": "Initiative",
+      "level": 2,
+      "description": "Initiative",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "name": "Objective",
+      "level": 3,
+      "description": "Product Objective / Initiative Name",
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "name": "Capital Investment",
+      "level": 4,
+      "description": "Capital Investment / Theme",
+      "integration_name": "Jira",
+      "active": true
+    }
+  ],
+  "wits_mappings": [
+    {
+      "wit_from": "Devops Story",
+      "wit_to": "Tech Enhancement",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Educational Services",
+      "wit_to": "Task",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Feature",
+      "wit_to": "Epic",
+      "hierarchy_level": 1,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Impediment",
+      "wit_to": "Task",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Performance",
+      "wit_to": "Tech Enhancement",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Requirement",
+      "wit_to": "Task",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Security Remediation",
+      "wit_to": "Tech Enhancement",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Shared Parameter",
+      "wit_to": "Task",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Shared Steps",
+      "wit_to": "Task",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Sprint Work item",
+      "wit_to": "Defect",
+      "hierarchy_level": -1,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Tech Debt",
+      "wit_to": "Tech Enhancement",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "UAT",
+      "wit_to": "Task",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Unparented Tasks",
+      "wit_to": "Task",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "User Story",
+      "wit_to": "Story",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    },
+    {
+      "wit_from": "Work item",
+      "wit_to": "Story",
+      "hierarchy_level": 0,
+      "integration_name": "Jira",
+      "active": true
+    }
+  ]
+}

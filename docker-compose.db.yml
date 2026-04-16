@@ -1,0 +1,146 @@
+# Docker Compose - PROD Environment
+# Porta: 5437 | Database: pulse_db
+# Infra compartilhada: Redis :6379 | RabbitMQ :5672/:15672 | Qdrant :6333/:6334
+
+name: gus-pulse
+
+services:
+  postgres-primary:
+    image: ghcr.io/postgresml/postgresml:2.10.0
+    container_name: pulse-postgres
+    entrypoint: [ "/custom-entrypoint.sh" ]
+    environment:
+      POSTGRES_DB: pulse
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: pulse
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: replicator_password
+      PGDATA: /var/lib/postgresql/data
+      TZ: America/New_York
+      PGTZ: America/New_York
+    ports:
+      - "5437:5432"
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./docker/postgres/custom-entrypoint.sh:/custom-entrypoint.sh:ro
+      - ./docker/postgres/primary/init-replication.sh:/docker-entrypoint-initdb.d/01-init-replication.sh:ro
+      - ./docker/postgres/init-postgresml.sql:/docker-entrypoint-initdb.d/02-init-postgresml.sql:ro
+      - ./docker/postgres/primary/postgresql.conf:/etc/pulse-config/postgresql.conf:ro
+      - ./docker/postgres/primary/pg_hba.conf:/etc/pulse-config/pg_hba.conf:ro
+    networks:
+      - pulse-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U pulse -d pulse" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  postgres-replica:
+    image: ghcr.io/postgresml/postgresml:2.10.0
+    container_name: pulse-postgres-replica
+    entrypoint: [ "/replica-entrypoint.sh" ]
+    environment:
+      POSTGRES_DB: pulse
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: pulse
+      POSTGRES_PRIMARY_HOST: pulse-postgres
+      POSTGRES_PRIMARY_PORT: 5432
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: replicator_password
+      PGDATA: /var/lib/postgresql/data
+      TZ: America/New_York
+      PGTZ: America/New_York
+    ports:
+      - "5438:5432"
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./docker/postgres/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    networks:
+      - pulse-network
+    restart: unless-stopped
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U pulse -d pulse" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  redis:
+    image: redis:7-alpine
+    container_name: pulse-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - pulse-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: pulse-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: pulse
+      RABBITMQ_DEFAULT_PASS: pulse
+      RABBITMQ_DEFAULT_VHOST: pulse_etl
+    networks:
+      - pulse-network
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.1
+    container_name: pulse-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: 6333
+      QDRANT__SERVICE__GRPC_PORT: 6334
+      QDRANT__LOG_LEVEL: INFO
+    networks:
+      - pulse-network
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:6333/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_primary_data:
+    name: pulse_postgres_primary_data
+  postgres_replica_data:
+    name: pulse_postgres_replica_data
+  redis_data:
+    name: pulse_redis_data
+  rabbitmq_data:
+    name: pulse_rabbitmq_data
+  qdrant_data:
+    name: pulse_qdrant_data
+
+networks:
+  pulse-network:
+    name: pulse-network

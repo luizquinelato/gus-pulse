@@ -1,0 +1,844 @@
+import { useState, useEffect, useRef } from 'react'
+import { motion } from 'framer-motion'
+import {
+  Play,
+  Clock,
+  Info,
+  CheckCircle,
+  XCircle,
+  Loader,
+  AlertCircle,
+  Settings
+} from 'lucide-react'
+import IntegrationLogo from './IntegrationLogo'
+import { etlWebSocketService, type JobProgress } from '../services/etlWebSocketService'
+import { jobsApi } from '../services/etlApiService'
+import { useTheme } from '../contexts/ThemeContext'
+import { useAuth } from '../contexts/AuthContext'
+
+interface JobCardProps {
+  job: {
+    id: number
+    job_name: string
+    status: {
+      overall: string
+      token?: string | null
+      reset_deadline?: string | null
+      reset_attempt?: number
+      steps?: Record<string, any>
+    }
+    active: boolean
+    schedule_interval_minutes: number
+    retry_interval_minutes: number
+    integration_type?: string
+    integration_logo_filename?: string
+    last_run_started_at?: string
+    last_run_finished_at?: string
+    next_run?: string
+    error_message?: string
+    retry_count: number
+  }
+  onRunNow: (jobId: number) => void
+  onShowDetails: (jobId: number) => void
+  onToggleActive: (jobId: number, active: boolean) => void
+  onSettings: (job: any) => void
+}
+
+export default function JobCard({ job, onRunNow, onShowDetails, onToggleActive, onSettings }: JobCardProps) {
+  const { theme } = useTheme()
+  const { user } = useAuth()
+  const [, setIsHovered] = useState(false)
+  const [isToggling, setIsToggling] = useState(false)
+  const [countdown, setCountdown] = useState<string>('Calculating...')
+
+  // Real-time worker status tracking
+  const [jobProgress, setJobProgress] = useState<JobProgress | null>(null)
+  const [realTimeStatus, setRealTimeStatus] = useState<string>(job.status?.overall || 'READY')
+  const [wsVersion, setWsVersion] = useState<number>(etlWebSocketService.getInitializationVersion())
+  const [isJobRunning, setIsJobRunning] = useState<boolean>(false)
+  const [finishedTransitionTimer, setFinishedTransitionTimer] = useState<NodeJS.Timeout | null>(null)
+  const [resetCountdown, setResetCountdown] = useState<number | null>(null)
+  const [jobToken, setJobToken] = useState<string | null>(null)  // 🔑 Store execution token
+  const [resetDeadline, setResetDeadline] = useState<string | null>(job.status?.reset_deadline || null)  // 🔑 Store reset deadline from WebSocket
+  const [wsNextRun, setWsNextRun] = useState<string | null>(null)  // 🔑 Store next_run from WebSocket (overrides prop when job resets)
+  // Track if we're currently resetting to prevent WebSocket from interfering
+  const isResettingRef = useRef<boolean>(false)
+  // Track WebSocket connection to prevent React StrictMode double connections
+  const wsConnectionRef = useRef<(() => void) | null>(null)
+
+  // Get display name for step from step data or fallback
+  const getStepDisplayName = (stepName: string) => {
+    if (jobProgress?.steps && jobProgress.steps[stepName]?.display_name) {
+      return jobProgress.steps[stepName].display_name
+    }
+    // Fallback: format step name nicely
+    return stepName.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
+  }
+
+  // Get available steps from job progress data, sorted by order
+  const getAvailableSteps = () => {
+    if (jobProgress?.steps) {
+      // Sort steps by order field
+      return Object.entries(jobProgress.steps)
+        .sort(([, a], [, b]) => (a.order || 0) - (b.order || 0))
+        .map(([stepName]) => stepName)
+    }
+
+    // Fallback to default Jira steps if no step data available (3-step structure)
+    return ['jira_issues_with_changelogs', 'jira_dev_status', 'jira_sprint_reports']
+  }
+
+
+
+  // Helper function to get step status from WebSocket data
+  const getStepStatus = (stepName: string, workerType: 'extraction' | 'transform' | 'embedding') => {
+    // Use detailed step data if available
+    if (jobProgress?.steps && jobProgress.steps[stepName]) {
+      return jobProgress.steps[stepName][workerType]
+    }
+
+    // Fallback to current worker status matching
+    if (!jobProgress) return 'idle'
+
+    const worker = jobProgress[workerType]
+    if (worker.step === stepName) {
+      return worker.status
+    }
+
+    return 'idle'
+  }
+
+
+
+
+
+  // Get status icon and color
+  const getStatusInfo = () => {
+    if (!job.active) {
+      return {
+        icon: <XCircle className="w-5 h-5" />,
+        color: 'text-gray-400',
+        bgColor: 'bg-gray-100',
+        label: 'Inactive'
+      }
+    }
+
+    switch (realTimeStatus) {
+      case 'RUNNING':
+        return {
+          icon: <Loader className="w-5 h-5 animate-spin" />,
+          color: 'text-blue-500',
+          bgColor: 'bg-blue-100',
+          label: 'Running'
+        }
+      case 'FINISHED':
+        return {
+          icon: <CheckCircle className="w-5 h-5" />,
+          color: 'text-green-500',
+          bgColor: 'bg-green-100',
+          label: 'Finished'
+        }
+      case 'FAILED':
+        return {
+          icon: <AlertCircle className="w-5 h-5" />,
+          color: 'text-red-500',
+          bgColor: 'bg-red-100',
+          label: 'Failed'
+        }
+      case 'RATE_LIMITED':
+        return {
+          icon: <AlertCircle className="w-5 h-5" />,
+          color: 'text-yellow-600',
+          bgColor: 'bg-yellow-100',
+          label: 'Rate Limited'
+        }
+      case 'READY':
+        return {
+          icon: <Clock className="w-5 h-5" />,
+          color: 'text-cyan-500',
+          bgColor: 'bg-cyan-100',
+          label: 'Ready'
+        }
+      default:
+        return {
+          icon: <Clock className="w-5 h-5" />,
+          color: 'text-gray-500',
+          bgColor: 'bg-gray-100',
+          label: 'Unknown'
+        }
+    }
+  }
+
+  const statusInfo = getStatusInfo()
+
+  // Parse backend timestamp to user's local time
+  const parseBackendTimestamp = (dateStr: string): Date => {
+    // Backend sends ISO format timestamps
+    // JavaScript's Date constructor automatically converts to user's local timezone
+    return new Date(dateStr)
+  }
+
+  // Format last run time
+  const formatLastRun = () => {
+    if (!job.last_run_finished_at) return 'Never'
+
+    const date = parseBackendTimestamp(job.last_run_finished_at)
+    const now = new Date()
+    const diffMs = now.getTime() - date.getTime()
+    const diffMins = Math.floor(diffMs / 60000)
+    const diffHours = Math.floor(diffMins / 60)
+    const diffDays = Math.floor(diffHours / 24)
+
+    if (diffMins < 1) return 'Just now'
+    if (diffMins < 60) return `${diffMins}m ago`
+    if (diffHours < 24) return `${diffHours}h ago`
+    if (diffDays < 7) return `${diffDays}d ago`
+    return date.toLocaleDateString()
+  }
+
+  // Format interval to readable string
+  const formatInterval = (minutes: number): string => {
+    if (minutes < 60) return `${minutes}m`
+    const hours = Math.floor(minutes / 60)
+    const mins = minutes % 60
+    if (mins === 0) return `${hours}h`
+    return `${hours}h ${mins}m`
+  }
+
+
+
+  // Format datetime with timezone - converts to user's local timezone
+  const formatDateTimeWithTZ = (dateStr: string | undefined): string => {
+    if (!dateStr) return 'Never'
+
+    const date = parseBackendTimestamp(dateStr)
+    const options: Intl.DateTimeFormatOptions = {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      timeZoneName: 'short'
+    }
+
+    return date.toLocaleString(undefined, options) // Use undefined to use user's locale
+  }
+
+  // Calculate countdown timer
+  useEffect(() => {
+    // Don't show countdown if job is not active or is currently running
+    if (!job.active || realTimeStatus === 'RUNNING' || isJobRunning) {
+      setCountdown('—')
+      return
+    }
+
+    // 🔑 Don't show countdown for RATE_LIMITED jobs - they show next_run time instead
+    if (realTimeStatus === 'RATE_LIMITED') {
+      setCountdown('—')
+      return
+    }
+
+    // 🔑 Don't show countdown for FINISHED jobs - they show reset countdown instead
+    if (realTimeStatus === 'FINISHED') {
+      setCountdown('—')
+      return
+    }
+
+    // 🔑 Use WebSocket next_run if available (takes precedence when job resets), otherwise use prop
+    const nextRunToUse = wsNextRun || job.next_run
+
+    if (!nextRunToUse || nextRunToUse === null || nextRunToUse === undefined) {
+      setCountdown('—')
+      return
+    }
+
+    const updateCountdown = () => {
+      const now = new Date()
+      const nextRun = new Date(nextRunToUse!)
+      const diff = nextRun.getTime() - now.getTime()
+
+      // If time has passed, show "Overdue"
+      if (diff <= 0) {
+        const overdueMins = Math.floor(Math.abs(diff) / 60000)
+        if (overdueMins > 60) {
+          const hours = Math.floor(overdueMins / 60)
+          setCountdown(`Overdue by ${hours}h`)
+        } else if (overdueMins > 0) {
+          setCountdown(`Overdue by ${overdueMins}m`)
+        } else {
+          setCountdown('Starting now...')
+        }
+        return
+      }
+
+      const totalSeconds = Math.floor(diff / 1000)
+      const hours = Math.floor(totalSeconds / 3600)
+      const minutes = Math.floor((totalSeconds % 3600) / 60)
+      const seconds = totalSeconds % 60
+
+      if (hours > 0) {
+        setCountdown(`${hours}h ${minutes}m`)
+      } else if (minutes > 0) {
+        setCountdown(`${minutes}m ${seconds}s`)
+      } else {
+        setCountdown(`${seconds}s`)
+      }
+    }
+
+    // Update immediately
+    updateCountdown()
+
+    // Update every second
+    const interval = setInterval(updateCountdown, 1000)
+
+    return () => clearInterval(interval)
+  }, [job.next_run, wsNextRun, job.active, realTimeStatus, isJobRunning])
+
+  // 🔑 System-level reset countdown - reads reset_deadline from WebSocket updates
+  // This countdown is managed by the backend scheduler and is the same for all users
+  // 🔑 SKIP countdown for RATE_LIMITED jobs - they don't have reset_deadline
+  useEffect(() => {
+    // Only show countdown for FINISHED status with a valid reset_deadline
+    if (realTimeStatus !== 'FINISHED' || !resetDeadline) {
+      setResetCountdown(null)
+      return
+    }
+
+    // Calculate remaining seconds based on reset_deadline from database
+    const updateCountdown = () => {
+      const now = Date.now()
+      const deadline = new Date(resetDeadline).getTime()
+      const remainingMs = deadline - now
+      const remainingSeconds = Math.max(0, Math.floor(remainingMs / 1000))
+
+      setResetCountdown(remainingSeconds)
+    }
+
+    // Update immediately
+    updateCountdown()
+
+    // Update every second
+    const interval = setInterval(updateCountdown, 1000)
+
+    return () => clearInterval(interval)
+  }, [realTimeStatus, resetDeadline])
+
+  // 🔑 No need to trigger reset when countdown reaches 0
+  // The backend scheduler automatically resets the job and sends WebSocket update
+  // Frontend just displays the countdown - the backend handles all the logic
+
+  // Sync realTimeStatus with job.status.overall prop when it changes (handles API updates)
+  useEffect(() => {
+    // Only update if the job status has actually changed
+    const newStatus = job.status?.overall || 'READY'
+    if (newStatus !== realTimeStatus) {
+      setRealTimeStatus(newStatus)
+    }
+  }, [job.status?.overall])
+
+  // Check for WebSocket service reinitialization (e.g., after logout/login)
+  useEffect(() => {
+    const currentVersion = etlWebSocketService.getInitializationVersion()
+    if (currentVersion !== wsVersion) {
+      // Service was reinitialized, update version to trigger reconnection
+      setWsVersion(currentVersion)
+    }
+  }, [wsVersion])
+
+  // WebSocket connection for real-time progress tracking - only for active jobs
+  useEffect(() => {
+    // Only establish WebSocket connection for active jobs
+    if (!job.active) {
+      // Clean up any existing connection
+      if (wsConnectionRef.current) {
+        wsConnectionRef.current()
+        wsConnectionRef.current = null
+      }
+      return
+    }
+
+    // If we already have a connection, don't create another one (React StrictMode protection)
+    if (wsConnectionRef.current) {
+      return wsConnectionRef.current
+    }
+
+    // Function to attempt WebSocket connection with retry for service initialization
+    const connectWithRetry = (retryCount = 0): (() => void) => {
+      // Check if service is ready
+      if (!etlWebSocketService.isReady()) {
+        if (retryCount < 10) { // Retry up to 10 times (1 second total)
+          setTimeout(() => connectWithRetry(retryCount + 1), 100)
+        }
+        return () => {} // Return empty cleanup function
+      }
+
+      // Get tenant ID from job or context (assuming it's available)
+      const tenantId = 1 // TODO: Get from context or job data
+
+      const cleanup = etlWebSocketService.connectToJob(tenantId, job.id, {
+        onJobProgress: (data: JobProgress) => {
+          // If we're currently resetting, ignore WebSocket updates to prevent interference
+          if (isResettingRef.current) {
+            return
+          }
+
+          // Always update job progress and step statuses (even after FINISHED)
+          setJobProgress(data)
+          setIsJobRunning(data.isActive)
+
+          // 🔑 Capture the execution token when job starts running
+          if (data.overall === 'RUNNING' && !jobToken && data.token) {
+            setJobToken(data.token)
+          }
+
+          // 🔑 CRITICAL FIX: Use the overall status from database directly
+          // Don't try to calculate it from individual worker statuses
+          // The backend already has the correct overall status
+          if (data.overall === 'RUNNING') {
+            setRealTimeStatus('RUNNING')
+            // Clear any existing finished transition timer
+            if (finishedTransitionTimer) {
+              clearTimeout(finishedTransitionTimer)
+              setFinishedTransitionTimer(null)
+            }
+            // 🔑 Clear reset countdown when job starts running (handles fast re-run during countdown)
+            if (resetCountdown !== null) {
+              setResetCountdown(null)
+              setResetDeadline(null)
+            }
+            // 🔑 Clear WebSocket next_run when job starts (will be recalculated on completion)
+            setWsNextRun(null)
+          } else if (data.overall === 'FAILED') {
+            setRealTimeStatus('FAILED')
+            // Clear any existing finished transition timer
+            if (finishedTransitionTimer) {
+              clearTimeout(finishedTransitionTimer)
+              setFinishedTransitionTimer(null)
+            }
+            // 🔑 Clear reset countdown when job fails
+            if (resetCountdown !== null) {
+              setResetCountdown(null)
+              setResetDeadline(null)
+            }
+          } else if (data.overall === 'FINISHED') {
+            // 🔑 System-level countdown is managed by the backend scheduler
+            // The countdown effect (lines 275-300) will automatically calculate
+            // the remaining time based on reset_deadline from the WebSocket data
+            // No need to manually set countdown here - just let the effect handle it
+
+            // 🔑 Update reset deadline from WebSocket data (only if not already set)
+            // This prevents the deadline from being overwritten when backend extends it
+            if (data.reset_deadline !== undefined && !resetDeadline) {
+              setResetDeadline(data.reset_deadline)
+            }
+
+            // 🔑 Update the status to FINISHED
+            setRealTimeStatus('FINISHED')
+
+            // Clear any existing timer first
+            if (finishedTransitionTimer) {
+              clearTimeout(finishedTransitionTimer)
+            }
+          } else if (data.overall === 'READY') {
+            // 🔑 Job has been reset to READY by the backend scheduler
+            setRealTimeStatus('READY')
+            setResetCountdown(null)
+            setResetDeadline(null)
+
+            // 🔑 Update next_run from WebSocket (if provided) to start countdown immediately
+            if (data.next_run) {
+              setWsNextRun(data.next_run)
+            }
+
+            // 🔑 Explicitly update jobProgress to ensure step statuses are reset
+            // This helps with browser compatibility (Edge sometimes doesn't update properly)
+            setJobProgress({
+              ...data,
+              extraction: { status: 'idle' },
+              transform: { status: 'idle' },
+              embedding: { status: 'idle' }
+            })
+          } else if (data.overall === 'RATE_LIMITED') {
+            // 🔑 Job hit rate limit - no countdown timer, just show next_run time
+            setRealTimeStatus('RATE_LIMITED')
+            setResetCountdown(null)
+            setResetDeadline(null)
+          }
+        }
+      })
+
+      return cleanup
+    }
+
+    const cleanup = connectWithRetry()
+    wsConnectionRef.current = cleanup
+
+    // Return cleanup function that clears the ref and calls the actual cleanup
+    return () => {
+      if (wsConnectionRef.current) {
+        wsConnectionRef.current()
+        wsConnectionRef.current = null
+      }
+      // Clear any pending finished transition timer
+      if (finishedTransitionTimer) {
+        clearTimeout(finishedTransitionTimer)
+        setFinishedTransitionTimer(null)
+      }
+    }
+  }, [job.id, job.active, wsVersion]) // Include wsVersion to reconnect when service reinitializes
+
+  // Update real-time status when job status changes
+  useEffect(() => {
+    setRealTimeStatus(job.status?.overall || 'READY')
+  }, [job.status])
+
+  // Clear state when job becomes inactive
+  useEffect(() => {
+    if (!job.active) {
+      setRealTimeStatus(job.status?.overall || 'READY') // Reset to actual job status
+      setJobProgress(null) // Clear worker progress
+      setIsJobRunning(false)
+      // Clear any pending finished transition timer
+      if (finishedTransitionTimer) {
+        clearTimeout(finishedTransitionTimer)
+        setFinishedTransitionTimer(null)
+      }
+    }
+  }, [job.active, job.status, finishedTransitionTimer])
+
+  return (
+    <motion.div
+      layout  // Enable layout animations for smooth repositioning
+      initial={{ opacity: 0, y: 20 }}
+      animate={{
+        opacity: 1,
+        y: 0
+      }}
+      transition={{ duration: 0.2, layout: { duration: 0.3 } }}  // Smooth layout transition
+      onMouseEnter={(e) => {
+        setIsHovered(true)
+        e.currentTarget.style.borderColor = 'var(--color-1)'
+        e.currentTarget.style.boxShadow = theme === 'dark'
+          ? '0 2px 2px 0 rgba(255, 255, 255, 0.08)'
+          : '0 2px 2px 0 rgba(0, 0, 0, 0.12)'
+      }}
+      onMouseLeave={(e) => {
+        setIsHovered(false)
+        e.currentTarget.style.borderColor = theme === 'dark' ? '#4a5568' : '#9ca3af'
+        e.currentTarget.style.boxShadow = theme === 'dark'
+          ? '0 2px 2px 0 rgba(255, 255, 255, 0.05)'
+          : '0 2px 2px 0 rgba(0, 0, 0, 0.1)'
+      }}
+      className={`card shadow-md ${!job.active ? '' : 'transition-all duration-200'}`}
+      style={{
+        backgroundColor: !job.active
+          ? (theme === 'dark' ? 'rgba(0, 0, 0, 0.3)' : 'rgba(0, 0, 0, 0.04)')
+          : undefined,
+        opacity: !job.active ? 0.6 : 1,  // Darker when inactive
+        padding: !job.active ? '0.75rem' : '1.5rem'  // Much smaller padding when inactive
+      }}
+    >
+      <div className="flex items-center justify-between">
+        {/* Left: Logo + Job Info */}
+        <div className={`flex items-center flex-1 ${!job.active ? 'space-x-3' : 'space-x-4'}`}>
+          {/* Integration Logo */}
+          <div className={`rounded-lg overflow-hidden flex items-center justify-center ${!job.active ? 'w-8 h-8' : 'w-12 h-12'}`}>
+            <IntegrationLogo
+              logoFilename={job.job_name === 'Config' ? 'internal.svg' : (job.integration_logo_filename || 'default-integration.svg')}
+              integrationName={job.integration_type || job.job_name}
+              className={!job.active ? 'w-6 h-6 object-contain' : 'w-10 h-10 object-contain'}
+            />
+          </div>
+
+          {/* Job Name and Status */}
+          <div className="flex-1">
+            <div className="flex items-center space-x-2">
+              <h3 className={`font-semibold ${!job.active ? 'text-base text-gray-400' : 'text-lg text-primary'}`}>
+                {job.job_name.toUpperCase()}
+              </h3>
+              {!job.active && (
+                <span className="text-xs px-2 py-1 rounded bg-gray-200 text-gray-600">
+                  Inactive
+                </span>
+              )}
+            </div>
+
+            {/* Show details only when active */}
+            {job.active && (
+              <div className="flex items-center space-x-4 mt-1">
+                {/* Status Badge */}
+                <div className={`flex items-center space-x-1 ${statusInfo.color}`}>
+                  {statusInfo.icon}
+                  <span className="text-sm font-medium">{statusInfo.label}</span>
+                </div>
+
+                {/* Rate Limit Display - Show when rate limited */}
+                {realTimeStatus === 'RATE_LIMITED' && job.next_run && (
+                  <div className="flex items-center space-x-1 text-yellow-600">
+                    <Clock className="w-4 h-4" />
+                    <span className="text-sm font-medium">Auto-resumes at {formatDateTimeWithTZ(job.next_run)}</span>
+                  </div>
+                )}
+
+                {/* Reset Countdown Timer - Show when resetting (not for rate limited) */}
+                {resetCountdown !== null && realTimeStatus !== 'RATE_LIMITED' && (
+                  <div className="flex items-center space-x-1 text-blue-500">
+                    <Clock className="w-4 h-4" />
+                    <span className="text-sm font-medium">Resetting in {resetCountdown}s</span>
+                  </div>
+                )}
+
+                {/* Schedule Interval */}
+                <span className="text-sm text-secondary">
+                  Interval: {formatInterval(job.schedule_interval_minutes)}
+                </span>
+
+                {/* Last Run */}
+                <span className="text-sm text-secondary">
+                  Last run: {formatLastRun()}
+                </span>
+
+                {/* Error Indicator */}
+                {job.error_message && (
+                  <span className="text-xs text-red-500 flex items-center space-x-1">
+                    <AlertCircle className="w-3 h-3" />
+                    <span>Error</span>
+                  </span>
+                )}
+
+                {/* Retry Count */}
+                {job.retry_count > 0 && (
+                  <span className="text-xs text-orange-500">
+                    Retries: {job.retry_count}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right: Action Buttons */}
+        <div className="flex items-center space-x-2">
+          {/* Run Now Button - Only show when active and status is READY, FAILED, or RATE_LIMITED */}
+          {job.active && (
+            <button
+              onClick={() => onRunNow(job.id)}
+              className={`px-4 py-2 rounded-lg flex items-center space-x-2 transition-all ${
+                realTimeStatus !== 'READY' && realTimeStatus !== 'FAILED' && realTimeStatus !== 'RATE_LIMITED'
+                  ? 'btn-crud-create opacity-50 cursor-not-allowed'
+                  : 'btn-crud-create hover:opacity-90'
+              }`}
+              title={
+                realTimeStatus === 'RUNNING' ? 'Job is currently running' :
+                realTimeStatus === 'FINISHED' ? 'Job is resetting, please wait...' :
+                realTimeStatus === 'RATE_LIMITED' ? 'Manually resume job (rate limit hit)' :
+                realTimeStatus === 'FAILED' ? 'Manually trigger job' :
+                realTimeStatus === 'READY' ? 'Manually trigger job' :
+                'Job status is not ready'
+              }
+              disabled={realTimeStatus !== 'READY' && realTimeStatus !== 'FAILED' && realTimeStatus !== 'RATE_LIMITED'}
+            >
+              <Play className="w-4 h-4" />
+              <span>Run Now</span>
+            </button>
+          )}
+
+          {/* Settings Button - Only show when active */}
+          {job.active && (
+            <button
+              onClick={() => onSettings(job)}
+              className="p-2 rounded-lg hover:bg-tertiary transition-colors"
+              title="Job Settings"
+            >
+              <Settings className="w-5 h-5 text-secondary" />
+            </button>
+          )}
+
+          {/* Details Button - Only show when active */}
+          {job.active && (
+            <button
+              onClick={() => onShowDetails(job.id)}
+              className="p-2 rounded-lg hover:bg-tertiary transition-colors"
+              title="View Details"
+            >
+              <Info className="w-5 h-5 text-secondary" />
+            </button>
+          )}
+
+          {/* On/Off Toggle - Always visible */}
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => {
+                setIsToggling(true)
+                try {
+                  onToggleActive(job.id, !job.active)
+                } finally {
+                  setIsToggling(false)
+                }
+              }}
+              disabled={isToggling || isJobRunning || realTimeStatus === 'RUNNING'}
+              className={`relative inline-flex h-5 w-10 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 ${
+                job.active
+                  ? 'bg-gradient-to-r from-green-500 to-green-600 focus:ring-green-500'
+                  : 'bg-gray-300 focus:ring-gray-400'
+              } ${isToggling || isJobRunning || realTimeStatus === 'RUNNING' ? 'opacity-50 cursor-not-allowed' : ''}`}
+              title={
+                isJobRunning || realTimeStatus === 'RUNNING'
+                  ? 'Cannot toggle while job is running'
+                  : job.active ? 'Deactivate job' : 'Activate job'
+              }
+            >
+              <span className="sr-only">Toggle job active</span>
+              <motion.span
+                className="inline-block h-3 w-3 transform rounded-full bg-white shadow-lg"
+                animate={{ x: job.active ? 24 : 4 }}
+                transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+              />
+            </button>
+            <span className="text-sm text-secondary w-8">
+              {job.active ? 'On' : 'Off'}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Worker Status Display (show when job is running or has worker progress) */}
+      {(realTimeStatus === 'RUNNING' || isJobRunning || jobProgress) && (
+        <div className="mt-4">
+          {/* Step-Based Progress Display */}
+          <div className="mt-3 space-y-1.5">
+            {/* Steps Grid - Fully dynamic columns based on number of steps */}
+            <div className={`grid gap-2 text-xs ${
+              getAvailableSteps().length === 1
+                ? 'grid-cols-1'  // 1 step: full width
+                : getAvailableSteps().length === 2
+                ? 'grid-cols-1 md:grid-cols-2'  // 2 steps: 2 columns on desktop
+                : getAvailableSteps().length === 3
+                ? 'grid-cols-1 md:grid-cols-3'  // 3 steps: 3 columns on desktop
+                : getAvailableSteps().length === 4
+                ? 'grid-cols-2 md:grid-cols-4'  // 4 steps: 4 columns on desktop
+                : getAvailableSteps().length === 5
+                ? 'grid-cols-2 md:grid-cols-5'  // 5 steps: 5 columns on desktop
+                : getAvailableSteps().length === 6
+                ? 'grid-cols-2 md:grid-cols-6'  // 6 steps: 6 columns on desktop
+                : getAvailableSteps().length === 7
+                ? 'grid-cols-2 md:grid-cols-7'  // 7 steps: 7 columns on desktop
+                : 'grid-cols-2 md:grid-cols-4'  // Default: 4 columns on desktop
+            }`}>
+              {getAvailableSteps().map((stepName) => {
+                const stepDisplayName = getStepDisplayName(stepName)
+
+                return (
+                  <div key={stepName} className="flex items-center justify-between p-2 bg-background/50 rounded border border-border/30">
+                    {/* Step Name */}
+                    <span className="text-secondary font-medium text-xs leading-tight truncate flex-1 mr-2" title={stepDisplayName}>
+                      {stepDisplayName}
+                    </span>
+
+                    {/* Worker Status Grid - 3 circles with labels vertically centered */}
+                    <div className="flex items-center space-x-2">
+                      {/* Extraction */}
+                      <div className="flex flex-col items-center space-y-0.5">
+                        <div
+                          className={`w-3 h-3 rounded-full ${
+                            getStepStatus(stepName, 'extraction') === 'running' ? 'bg-blue-500 animate-pulse' :
+                            getStepStatus(stepName, 'extraction') === 'finished' ? 'bg-green-500' :
+                            getStepStatus(stepName, 'extraction') === 'failed' ? 'bg-red-500' :
+                            'bg-gray-300'
+                          }`}
+                          title={`Extraction: ${getStepStatus(stepName, 'extraction')}`}
+                        />
+                        <span className="text-[8px] text-secondary font-mono">E</span>
+                      </div>
+                      {/* Transform */}
+                      <div className="flex flex-col items-center space-y-0.5">
+                        <div
+                          className={`w-3 h-3 rounded-full ${
+                            getStepStatus(stepName, 'transform') === 'running' ? 'bg-blue-500 animate-pulse' :
+                            getStepStatus(stepName, 'transform') === 'finished' ? 'bg-green-500' :
+                            getStepStatus(stepName, 'transform') === 'failed' ? 'bg-red-500' :
+                            'bg-gray-300'
+                          }`}
+                          title={`Transform: ${getStepStatus(stepName, 'transform')}`}
+                        />
+                        <span className="text-[8px] text-secondary font-mono">T</span>
+                      </div>
+                      {/* Embedding */}
+                      <div className="flex flex-col items-center space-y-0.5">
+                        <div
+                          className={`w-3 h-3 rounded-full ${
+                            getStepStatus(stepName, 'embedding') === 'running' ? 'bg-blue-500 animate-pulse' :
+                            getStepStatus(stepName, 'embedding') === 'finished' ? 'bg-green-500' :
+                            getStepStatus(stepName, 'embedding') === 'failed' ? 'bg-red-500' :
+                            'bg-gray-300'
+                          }`}
+                          title={`Embedding: ${getStepStatus(stepName, 'embedding')}`}
+                        />
+                        <span className="text-[8px] text-secondary font-mono">E</span>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+
+            {/* Color Legend */}
+            <div className="mt-3 pt-2">
+              <div className="flex items-center space-x-3 text-[10px] text-secondary">
+                <div className="flex items-center space-x-1">
+                  <div className="w-2 h-2 bg-gray-300 rounded-full" />
+                  <span>Idle</span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <div className="w-2 h-2 bg-blue-500 rounded-full" />
+                  <span>Running</span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <div className="w-2 h-2 bg-green-500 rounded-full" />
+                  <span>Done</span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <div className="w-2 h-2 bg-red-500 rounded-full" />
+                  <span>Failed</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Additional Info Row - Show when active */}
+      {job.active && (
+        <motion.div
+          initial={{ opacity: 0, height: 0 }}
+          animate={{ opacity: 1, height: 'auto' }}
+          className="mt-4 pt-4 border-t border-border"
+        >
+
+          <div className="grid grid-cols-3 gap-4 text-sm">
+            <div>
+              <span className="text-secondary">Last Run:</span>
+              <span className="ml-2 text-primary font-medium text-xs">
+                {formatDateTimeWithTZ(job.last_run_finished_at)}
+              </span>
+            </div>
+            <div>
+              <span className="text-secondary">Next Run:</span>
+              <span className="ml-2 text-primary font-medium text-xs">
+                {(realTimeStatus === 'RUNNING' || realTimeStatus === 'FINISHED') ? '—' : ((wsNextRun || job.next_run) ? formatDateTimeWithTZ(wsNextRun || job.next_run) : '—')}
+              </span>
+            </div>
+            <div>
+              <span className="text-secondary">Countdown:</span>
+              <span className="ml-2 text-primary font-medium font-mono">
+                {countdown}
+              </span>
+            </div>
+          </div>
+        </motion.div>
+      )}
+    </motion.div>
+  )
+}
+
