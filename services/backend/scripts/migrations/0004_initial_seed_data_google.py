@@ -133,8 +133,9 @@ def apply(connection):
             import os
 
             # Try to find .env file in multiple locations
+            # __file__ is in migrations/, so '..' = scripts/, '../..' = backend/
             env_paths = [
-                os.path.join(os.path.dirname(__file__), '..', '.env'),  # services/backend/.env
+                os.path.join(os.path.dirname(__file__), '..', '..', '.env'),  # services/backend/.env
                 os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '.env'),  # project root/.env
             ]
 
@@ -294,14 +295,19 @@ def apply(connection):
         ai_model = os.getenv("AI_MODEL")
         ai_fallback_model = os.getenv("AI_FALLBACK_MODEL")
 
+        # Initialize before conditional so embedding section can always reference them
+        encrypted_ai_key = None
+        ai_gateway_active = False
+
         if ai_gateway_base_url and ai_gateway_api_key and ai_model:
             # Encrypt the AI Gateway API key
             encrypted_ai_key = AppConfig.encrypt_token(ai_gateway_api_key, key)
+            ai_gateway_active = True
             print("   🔐 AI Gateway API key encrypted successfully")
 
             # Primary AI Gateway settings
             ai_gateway_settings = {
-                "model": "bedrock-claude-sonnet-4-v1",
+                "model": ai_model,
                 "model_config": {
                     "temperature": 0.3,
                     "max_tokens": 700,
@@ -781,34 +787,25 @@ def apply(connection):
             {
                 "email": "admin@google.com",
                 "password_hash": hash_password(admin_password),
-                "first_name": "Gustavo",
-                "last_name": "Quinelato",
+                "first_name": "Google",
+                "last_name": "Admin",
                 "role": "admin",
                 "is_admin": True,
                 "auth_provider": "local"
             },
             {
-                "email": "admin@pulse.com",
-                "password_hash": hash_password(admin_password),
-                "first_name": "System",
-                "last_name": "Administrator",
-                "role": "admin",
-                "is_admin": True,
-                "auth_provider": "local"
-            },
-            {
-                "email": "user@pulse.com",
+                "email": "user@google.com",
                 "password_hash": hash_password(default_password),
-                "first_name": "Test",
+                "first_name": "Google",
                 "last_name": "User",
                 "role": "user",
                 "is_admin": False,
                 "auth_provider": "local"
             },
             {
-                "email": "viewer@pulse.com",
+                "email": "viewer@google.com",
                 "password_hash": hash_password(default_password),
-                "first_name": "Test",
+                "first_name": "Google",
                 "last_name": "Viewer",
                 "role": "viewer",
                 "is_admin": False,
