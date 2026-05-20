@@ -18,9 +18,14 @@ class WEXGatewayProvider:
     """Enhanced WEX AI Gateway provider with batching and cost tracking"""
 
     def __init__(self, integration: Integration):
+        import os
         self.integration = integration
-        self.base_url = integration.base_url
-        self.api_key = AppConfig.decrypt_token(integration.password, AppConfig.load_key()) if integration.password else None
+        self.base_url = integration.base_url or os.getenv("WEX_AI_GATEWAY_BASE_URL", "https://aips-ai-gateway.dev.ai-platform.int.wexfabric.com/")
+        self.api_key = (
+            AppConfig.decrypt_token(integration.password, AppConfig.load_key())
+            if integration.password
+            else os.getenv("WEX_AI_GATEWAY_API_KEY")
+        )
 
         # Extract settings from JSON field (new schema)
         settings = integration.settings or {}

@@ -145,8 +145,9 @@ def apply(connection):
             import os
 
             # Try to find .env file in multiple locations
+            # __file__ is in migrations/, so '..' = scripts/, '../..' = backend/
             env_paths = [
-                os.path.join(os.path.dirname(__file__), '..', '.env'),  # services/backend/.env
+                os.path.join(os.path.dirname(__file__), '..', '..', '.env'),  # services/backend/.env
                 os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '.env'),  # project root/.env
             ]
 
@@ -308,19 +309,75 @@ def apply(connection):
 
         # Create AI Gateway integration
         print("   📋 Creating AI Gateway integration...")
-        ai_gateway_base_url = os.getenv("WEX_AI_GATEWAY_BASE_URL")
+        ai_gateway_base_url = os.getenv("WEX_AI_GATEWAY_BASE_URL", "https://aips-ai-gateway.dev.ai-platform.int.wexfabric.com/")
         ai_gateway_api_key = os.getenv("WEX_AI_GATEWAY_API_KEY")
-        ai_model = os.getenv("AI_MODEL")
         ai_fallback_model = os.getenv("AI_FALLBACK_MODEL")
 
-        if ai_gateway_base_url and ai_gateway_api_key and ai_model:
-            # Encrypt the AI Gateway API key
-            encrypted_ai_key = AppConfig.encrypt_token(ai_gateway_api_key, key)
-            print("   🔐 AI Gateway API key encrypted successfully")
+        # Encrypt the API key if available, otherwise store None (integration will be inactive)
+        encrypted_ai_key = None
+        ai_gateway_active = False
+        if ai_gateway_api_key:
+            try:
+                encrypted_ai_key = AppConfig.encrypt_token(ai_gateway_api_key, key)
+                ai_gateway_active = True
+                print("   🔐 AI Gateway API key encrypted successfully")
+            except Exception as e:
+                print(f"   ⚠️ Could not encrypt AI Gateway API key: {e} - integration will be inactive")
+        else:
+            print("   ⚠️ WEX_AI_GATEWAY_API_KEY not set in .env - AI Gateway integration will be inactive")
 
-            # Primary AI Gateway settings
-            ai_gateway_settings = {
-                "model": "bedrock-claude-sonnet-4-v1",
+        # Primary AI Gateway settings — model read from AI_MODEL env var
+        ai_model = os.getenv("AI_MODEL", "bedrock-claude-sonnet-4-6-v1")
+        ai_gateway_settings = {
+            "model": ai_model,
+            "model_config": {
+                "temperature": 0.3,
+                "max_tokens": 700,
+                "gateway_route": True,
+                "source": "external"
+            },
+            "cost_config": {
+                "max_monthly_cost": 1000,
+                "alert_threshold": 0.8
+            }
+        }
+
+        # Always insert the WEX AI Gateway integration — always active for WEX tenant
+        cursor.execute("""
+            INSERT INTO integrations (
+                provider, type, username, password, base_url, settings,
+                logo_filename, tenant_id, active, created_at, last_updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (provider, tenant_id) DO UPDATE SET
+                password = EXCLUDED.password,
+                base_url = EXCLUDED.base_url,
+                settings = EXCLUDED.settings,
+                active = EXCLUDED.active,
+                last_updated_at = NOW()
+            RETURNING id;
+        """, (
+            "WEX AI Gateway", "AI", None, encrypted_ai_key, ai_gateway_base_url, json.dumps(ai_gateway_settings),
+            "wex-ai-gateway.svg", tenant_id, True
+        ))
+
+        ai_gateway_result = cursor.fetchone()
+        if ai_gateway_result:
+            ai_gateway_integration_id = ai_gateway_result['id']
+        else:
+            cursor.execute("SELECT id FROM integrations WHERE provider = 'WEX AI Gateway' AND tenant_id = %s;", (tenant_id,))
+            result = cursor.fetchone()
+            if result:
+                ai_gateway_integration_id = result['id']
+            else:
+                raise Exception("Failed to create or find WEX AI Gateway integration")
+
+        print(f"   ✅ AI Gateway integration created (ID: {ai_gateway_integration_id}, model: {ai_model}, active: {ai_gateway_active})")
+
+        # Create fallback AI Gateway integration if fallback model is specified and credentials are available
+        if ai_gateway_active and ai_fallback_model:
+            ai_fallback_settings = {
+                "model": "azure-gpt-4o-mini",
                 "model_config": {
                     "temperature": 0.3,
                     "max_tokens": 700,
@@ -328,12 +385,11 @@ def apply(connection):
                     "source": "external"
                 },
                 "cost_config": {
-                    "max_monthly_cost": 1000,
+                    "max_monthly_cost": 500,
                     "alert_threshold": 0.8
                 }
             }
 
-            # Create primary AI Gateway integration
             cursor.execute("""
                 INSERT INTO integrations (
                     provider, type, username, password, base_url, settings,
@@ -343,70 +399,24 @@ def apply(connection):
                 ON CONFLICT (provider, tenant_id) DO NOTHING
                 RETURNING id;
             """, (
-                "WEX AI Gateway", "AI", None, encrypted_ai_key, ai_gateway_base_url, json.dumps(ai_gateway_settings),
-                "wex-ai-gateway.svg", tenant_id, True
+                "WEX AI Gateway Fallback", "AI", None, encrypted_ai_key, ai_gateway_base_url, json.dumps(ai_fallback_settings),
+                "wex-ai-gateway-fallback.svg", tenant_id, True
             ))
 
-            ai_gateway_result = cursor.fetchone()
-            if ai_gateway_result:
-                ai_gateway_integration_id = ai_gateway_result['id']
-            else:
-                cursor.execute("SELECT id FROM integrations WHERE provider = 'WEX AI Gateway' AND tenant_id = %s;", (tenant_id,))
-                result = cursor.fetchone()
-                if result:
-                    ai_gateway_integration_id = result['id']
-                else:
-                    raise Exception("Failed to create or find WEX AI Gateway integration")
-
-            print(f"   ✅ AI Gateway integration created (ID: {ai_gateway_integration_id}, model: {ai_model})")
-
-            # Create fallback AI Gateway integration if fallback model is specified
-            if ai_fallback_model and ai_fallback_model != ai_model:
-                # Fallback AI Gateway settings
-                ai_fallback_settings = {
-                    "model": "azure-gpt-4o-mini",
-                    "model_config": {
-                        "temperature": 0.3,
-                        "max_tokens": 700,
-                        "gateway_route": True,
-                        "source": "external"
-                    },
-                    "cost_config": {
-                        "max_monthly_cost": 500,
-                        "alert_threshold": 0.8
-                    }
-                }
-
+            fallback_result = cursor.fetchone()
+            if fallback_result:
+                fallback_integration_id = fallback_result['id']
                 cursor.execute("""
-                    INSERT INTO integrations (
-                        provider, type, username, password, base_url, settings,
-                        logo_filename, tenant_id, active, created_at, last_updated_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-                    ON CONFLICT (provider, tenant_id) DO NOTHING
-                    RETURNING id;
-                """, (
-                    "WEX AI Gateway Fallback", "AI", None, encrypted_ai_key, ai_gateway_base_url, json.dumps(ai_fallback_settings),
-                    "wex-ai-gateway-fallback.svg", tenant_id, True
-                ))
-
-                fallback_result = cursor.fetchone()
-                if fallback_result:
-                    fallback_integration_id = fallback_result['id']
-                    # Update primary integration to point to fallback
-                    cursor.execute("""
-                        UPDATE integrations SET fallback_integration_id = %s
-                        WHERE id = %s;
-                    """, (fallback_integration_id, ai_gateway_integration_id))
-                    print(f"   ✅ AI Gateway fallback integration created (ID: {fallback_integration_id}, model: {ai_fallback_model})")
-                    print(f"   🔗 Primary integration (ID: {ai_gateway_integration_id}) linked to fallback (ID: {fallback_integration_id})")
-        else:
-            print("   ⚠️ AI Gateway credentials not found in .env - skipping AI Gateway integration")
+                    UPDATE integrations SET fallback_integration_id = %s
+                    WHERE id = %s;
+                """, (fallback_integration_id, ai_gateway_integration_id))
+                print(f"   ✅ AI Gateway fallback integration created (ID: {fallback_integration_id}, model: {ai_fallback_model})")
+                print(f"   🔗 Primary integration (ID: {ai_gateway_integration_id}) linked to fallback (ID: {fallback_integration_id})")
 
         # Create embedding integrations
         print("   📋 Creating embedding integrations...")
 
-        # Free local embedding settings
+        # Free local embedding (always inserted, inactive - external is primary)
         local_embedding_settings = {
             "model_path": "models/sentence-transformers/all-mpnet-base-v2",
             "cost_tier": "free",
@@ -414,7 +424,6 @@ def apply(connection):
             "source": "local"
         }
 
-        # Free local embedding
         cursor.execute("""
             INSERT INTO integrations (
                 provider, type, username, password, base_url, settings,
@@ -425,7 +434,7 @@ def apply(connection):
             RETURNING id;
         """, (
             "MPNet base-v2", "Embedding", None, None, None, json.dumps(local_embedding_settings),
-            "local-embeddings.svg", tenant_id, False  # Set to inactive - using external embeddings as primary
+            "local-embeddings.svg", tenant_id, False  # Inactive - external embeddings are primary
         ))
 
         local_embedding_result = cursor.fetchone()
@@ -433,36 +442,36 @@ def apply(connection):
             local_embedding_id = local_embedding_result['id']
             print(f"   ✅ Local embedding integration created (ID: {local_embedding_id})")
 
-        # Paid external embedding (WEX AI Gateway)
-        if ai_gateway_base_url and encrypted_ai_key:
-            # Azure embedding settings
-            azure_embedding_settings = {
-                "model_path": "azure-text-embedding-3-small",
-                "cost_tier": "paid",
-                "gateway_route": True,
-                "source": "external"
-            }
+        # Azure external embedding via WEX AI Gateway — always active for WEX tenant
+        azure_embedding_settings = {
+            "model_path": "azure-text-embedding-3-small",
+            "cost_tier": "paid",
+            "gateway_route": True,
+            "source": "external"
+        }
 
-            cursor.execute("""
-                INSERT INTO integrations (
-                    provider, type, username, password, base_url, settings,
-                    logo_filename, tenant_id, active, created_at, last_updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-                ON CONFLICT (provider, tenant_id) DO NOTHING
-                RETURNING id;
-            """, (
-                "Azure 3-small", "Embedding", None, encrypted_ai_key, ai_gateway_base_url, json.dumps(azure_embedding_settings),
-                "wex-embeddings.svg", tenant_id, True  # Set to active - external embeddings as primary
-            ))
+        cursor.execute("""
+            INSERT INTO integrations (
+                provider, type, username, password, base_url, settings,
+                logo_filename, tenant_id, active, created_at, last_updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (provider, tenant_id) DO UPDATE SET
+                password = EXCLUDED.password,
+                base_url = EXCLUDED.base_url,
+                settings = EXCLUDED.settings,
+                active = EXCLUDED.active,
+                last_updated_at = NOW()
+            RETURNING id;
+        """, (
+            "Azure 3-small", "Embedding", None, encrypted_ai_key, ai_gateway_base_url, json.dumps(azure_embedding_settings),
+            "wex-embeddings.svg", tenant_id, True
+        ))
 
-            paid_embedding_result = cursor.fetchone()
-            if paid_embedding_result:
-                paid_embedding_id = paid_embedding_result['id']
-                # Embedding integrations do not use fallbacks
-                print(f"   ✅ WEX embedding integration created (ID: {paid_embedding_id})")
-        else:
-            print("   ⚠️ AI Gateway credentials not found - skipping WEX embedding integration")
+        paid_embedding_result = cursor.fetchone()
+        if paid_embedding_result:
+            paid_embedding_id = paid_embedding_result['id']
+            print(f"   ✅ Azure 3-small embedding integration created (ID: {paid_embedding_id}, active: True)")
 
         # Create WEX Fabric integration (placeholder for future)
         print("   📋 Creating WEX Fabric integration...")
@@ -1276,9 +1285,9 @@ def apply(connection):
 
         default_users_data = [
             {
-                "email": "gustavoquinelato@gmail.com",
+                "email": "gustavo.quinelato@wexinc.com",
                 "password_hash": hash_password(admin_password),
-                "first_name": "Luiz Gustavo",
+                "first_name": "Gustavo",
                 "last_name": "Quinelato",
                 "role": "admin",
                 "is_admin": True,
